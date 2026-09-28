@@ -148,9 +148,9 @@ static void hid_pointer_event(DeviceState *dev, QemuConsole *src,
                 e->dz--;
             } else if (evt->btn.button == INPUT_BUTTON_WHEEL_DOWN) {
                 e->dz++;
-            } else if (btn->button == INPUT_BUTTON_WHEEL_LEFT) {
+            } else if (evt->btn.button == INPUT_BUTTON_WHEEL_LEFT) {
                 e->pan--;
-            } else if (btn->button == INPUT_BUTTON_WHEEL_RIGHT) {
+            } else if (evt->btn.button == INPUT_BUTTON_WHEEL_RIGHT) {
                 e->pan++;
             }
         } else {
