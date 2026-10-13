@@ -145,16 +145,24 @@ static void hid_pointer_event(DeviceState *dev, QemuConsole *src,
         if (evt->btn.down) {
             e->buttons_state |= bmap[evt->btn.button];
             if (evt->btn.button == INPUT_BUTTON_WHEEL_UP) {
-                e->dz--;
+                e->dz -= INPUT_EVENT_SCROLL_DETENT;
             } else if (evt->btn.button == INPUT_BUTTON_WHEEL_DOWN) {
-                e->dz++;
+                e->dz += INPUT_EVENT_SCROLL_DETENT;
             } else if (evt->btn.button == INPUT_BUTTON_WHEEL_LEFT) {
-                e->pan--;
+                e->pan -= INPUT_EVENT_SCROLL_DETENT;
             } else if (evt->btn.button == INPUT_BUTTON_WHEEL_RIGHT) {
-                e->pan++;
+                e->pan += INPUT_EVENT_SCROLL_DETENT;
             }
         } else {
             e->buttons_state &= ~bmap[evt->btn.button];
+        }
+        break;
+
+    case INPUT_EVENT_KIND_SCROLL:
+        if (evt->scroll.axis == INPUT_SCROLL_AXIS_VERTICAL) {
+            e->dz += evt->scroll.value;
+        } else if (evt->scroll.axis == INPUT_SCROLL_AXIS_HORIZONTAL) {
+            e->pan += evt->scroll.value;
         }
         break;
 
@@ -356,10 +364,21 @@ void hid_pointer_activate(HIDState *hs)
     }
 }
 
+static int hid_scroll_counts(int32_t *pending, int32_t *residual, int mult)
+{
+    int unit = INPUT_EVENT_SCROLL_DETENT / mult;
+    int32_t acc = *pending + *residual;
+    int counts = int_clamp(acc / unit, -127, 127);
+
+    acc -= counts * unit;
+    *residual = acc % unit;
+    *pending = acc - *residual;
+    return counts;
+}
+
 int hid_pointer_poll(HIDState *hs, uint8_t *buf, int len)
 {
-    int dx, dy, dz, pan, l;
-    int wheel_divisor, pan_divisor;
+    int dx, dy, dz, pan, l, mult;
     int index;
     HIDPointerEvent *e;
 
@@ -381,59 +400,19 @@ int hid_pointer_poll(HIDState *hs, uint8_t *buf, int len)
         dx = e->xdx;
         dy = e->ydy;
     }
-    dz = int_clamp(e->dz, -127, 127);
-    e->dz -= dz;
-    pan = int_clamp(e->pan, -127, 127);
-    e->pan -= pan;
-
-
-    if (hs->kind == HID_MOUSE && hs->protocol != 0) {
-        switch (hs->ptr.wheel_multiplier & 0x03) {
-        case 0:
-            wheel_divisor = 1;
-            break;
-        case 1:
-            wheel_divisor = 4;
-            break;
-        case 2:
-            wheel_divisor = 8;
-            break;
-        default:
-            wheel_divisor = 16;
-            break;
-        }
-
-        switch (hs->ptr.pan_multiplier & 0x03) {
-        case 0:
-            pan_divisor = 1;
-            break;
-        case 1:
-            pan_divisor = 4;
-            break;
-        case 2:
-            pan_divisor = 8;
-            break;
-        default:
-            pan_divisor = 16;
-            break;
-        }
-
-        if (wheel_divisor > 1) {
-            hs->ptr.wheel_residual += dz;
-            dz = hs->ptr.wheel_residual / wheel_divisor;
-            hs->ptr.wheel_residual -= dz * wheel_divisor;
-        } else {
-            hs->ptr.wheel_residual = 0;
-        }
-
-        if (pan_divisor > 1) {
-            hs->ptr.pan_residual += pan;
-            pan = hs->ptr.pan_residual / pan_divisor;
-            hs->ptr.pan_residual -= pan * pan_divisor;
-        } else {
-            hs->ptr.pan_residual = 0;
-        }
+    mult = 1;
+    if (hs->kind == HID_MOUSE && hs->protocol != 0 &&
+        hs->ptr.wheel_multiplier) {
+        mult = HID_WHEEL_RESOLUTION_MULTIPLIER;
     }
+    dz = hid_scroll_counts(&e->dz, &hs->ptr.wheel_residual, mult);
+
+    mult = 1;
+    if (hs->kind == HID_MOUSE && hs->protocol != 0 &&
+        hs->ptr.pan_multiplier) {
+        mult = HID_WHEEL_RESOLUTION_MULTIPLIER;
+    }
+    pan = hid_scroll_counts(&e->pan, &hs->ptr.pan_residual, mult);
 
     if (hs->n &&
         !e->dz &&
@@ -446,7 +425,6 @@ int hid_pointer_poll(HIDState *hs, uint8_t *buf, int len)
 
     /* Appears we have to invert the wheel direction */
     dz = 0 - dz;
-    pan = 0 - pan;
     l = 0;
 
     switch (hs->kind) {
@@ -601,7 +579,8 @@ static const QemuInputHandler hid_keyboard_handler = {
 
 static const QemuInputHandler hid_mouse_handler = {
     .name  = "QEMU HID Mouse",
-    .mask  = INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_REL,
+    .mask  = INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_REL |
+             INPUT_EVENT_MASK_SCROLL,
     .event = hid_pointer_event,
     .sync  = hid_pointer_sync,
 };

@@ -495,7 +495,7 @@ static const uint8_t qemu_mouse_hid_report_descriptor[] = {
     0x15, 0x00,     /*  Logical Minimum (0) */
     0x25, 0x01,     /*  Logical Maximum (1) */
     0x35, 0x01,     /*  Physical Minimum (1) */
-    0x45, 0x04,     /*  Physical Maximum (4) */
+    0x45, 0x78,     /*  Physical Maximum (120) */
     0x75, 0x02,     /*  Report Size (2) */
     0x95, 0x01,     /*  Report Count (1) */
     0xB1, 0x02,     /*  Feature (Data,Var,Abs) */
@@ -520,7 +520,7 @@ static const uint8_t qemu_mouse_hid_report_descriptor[] = {
     0x15, 0x00,     /*  Logical Minimum (0) */
     0x25, 0x01,     /*  Logical Maximum (1) */
     0x35, 0x01,     /*  Physical Minimum (1) */
-    0x45, 0x04,     /*  Physical Maximum (4) */
+    0x45, 0x78,     /*  Physical Maximum (120) */
     0x75, 0x02,     /*  Report Size (2) */
     0x95, 0x01,     /*  Report Count (1) */
     0xB1, 0x02,     /*  Feature (Data,Var,Abs) */

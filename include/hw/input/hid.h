@@ -7,6 +7,8 @@
 #define HID_TABLET    2
 #define HID_KEYBOARD  3
 
+#define HID_WHEEL_RESOLUTION_MULTIPLIER 120
+
 typedef struct HIDPointerEvent {
     int32_t xdx, ydy; /* relative iff it's a mouse, otherwise absolute */
     int32_t dz, buttons_state;
