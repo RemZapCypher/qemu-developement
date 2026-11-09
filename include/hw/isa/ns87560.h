@@ -83,6 +83,11 @@ struct NS87560LIOState {
     uint16_t pic_level;         /* derived: level driven to each 8259 input */
     uint64_t unimp_logged;      /* config registers already reported */
     ISADevice *fdc;
+    ISADevice *pit;
+    MemoryRegion port61_io, port92_io, apm_io;
+    uint8_t port61;             /* bits 3:0 written; bit 4 refresh toggle */
+    uint8_t port92;
+    uint8_t apm[2];             /* B2h control, B3h status */
     I8257State *dma[2];         /* channels 0-3, 4-7 */
     MemoryRegion dma_hipage_io; /* 480h-48Fh; values live in the i8257s */
     MemoryRegion fdccfg_idx_io;     /* FDCBAR+0: SRA, config index */
