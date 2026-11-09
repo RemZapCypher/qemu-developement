@@ -145,7 +145,8 @@ qtests_avr = [ 'boot-serial-test' ]
 
 qtests_hppa = \
   qtests_filter + \
-  (config_all_devices.has_key('CONFIG_VGA') ? ['display-vga-test'] : [])
+  (config_all_devices.has_key('CONFIG_VGA') ? ['display-vga-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_NS87560') ? ['ns87560-test'] : [])
 
 qtests_loongarch64 = qtests_filter + \
   (config_all_devices.has_key('CONFIG_LOONGARCH_VIRT') ? ['numa-test'] : []) + \

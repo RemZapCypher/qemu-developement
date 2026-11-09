@@ -28,6 +28,7 @@
 #include "hw/pci/pci_device.h"
 #include "hw/pci-host/astro.h"
 #include "hw/pci-host/dino.h"
+#include "hw/isa/ns87560.h"
 #include "hw/misc/lasi.h"
 #include "hppa_hardware.h"
 #include "qemu/units.h"
@@ -43,6 +44,8 @@ static hwaddr soft_power_reg;
 #define enable_lasi_lan()       0
 
 static DeviceState *lasi_dev;
+/* C3700 only: NS87560 SuperIO chip at PCI slot 14 (one machine per process) */
+static bool c3700_superio;
 
 static void hppa_powerdown_req(Notifier *n, void *opaque)
 {
@@ -633,8 +636,27 @@ static void machine_HP_C3700_init(MachineState *machine)
     pci_bus = PCI_BUS(qdev_get_child_bus(DEVICE(astro->elroy[0]), "pci"));
     assert(pci_bus);
 
+    /* Before the tail, which places devices at the lowest free slots */
+    if (c3700_superio) {
+        DeviceState *sio = qdev_new(TYPE_NS87560);
+
+        object_property_set_link(OBJECT(sio), "bus", OBJECT(pci_bus),
+                                 &error_abort);
+        qdev_realize_and_unref(sio, NULL, &error_fatal);
+    }
+
     /* Add SCSI discs, NICs, graphics & load firmware */
     machine_HP_common_init_tail(machine, pci_bus, translate);
+}
+
+static bool c3700_get_superio(Object *obj, Error **errp)
+{
+    return c3700_superio;
+}
+
+static void c3700_set_superio(Object *obj, bool value, Error **errp)
+{
+    c3700_superio = value;
 }
 
 static void hppa_machine_reset(MachineState *ms, ResetType type)
@@ -742,6 +764,12 @@ static void HP_C3700_machine_init_class_init(ObjectClass *oc, void *data)
     mc->default_nic = "tulip";
 
     nc->nmi_monitor_handler = hppa_nmi;
+
+    object_class_property_add_bool(oc, "superio", c3700_get_superio,
+                                   c3700_set_superio);
+    object_class_property_set_description(oc, "superio",
+        "Set on/off to enable/disable the NS87560 SuperIO chip at PCI "
+        "slot 14 (default: off)");
 }
 
 static const TypeInfo HP_C3700_machine_init_typeinfo = {

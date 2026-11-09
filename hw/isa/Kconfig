@@ -75,3 +75,16 @@ config LPC_ICH9
     select ISA_BUS
     select ACPI_ICH9
     select MC146818RTC
+
+config NS87560
+    bool
+    depends on PCI
+    select ISA_BUS
+    select I8259
+    select I8254
+    select I8257
+    select SERIAL_ISA
+    select PARALLEL
+    select FDC_ISA
+    select IDE_NS87415
+    select USB_OHCI

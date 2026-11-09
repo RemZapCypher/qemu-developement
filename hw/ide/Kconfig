@@ -43,6 +43,11 @@ config IDE_VIA
     bool
     select IDE_PCI
 
+config IDE_NS87415
+    bool
+    depends on NS87560
+    select IDE_PCI
+
 config AHCI
     bool
     select IDE_BUS
