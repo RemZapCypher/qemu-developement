@@ -9,6 +9,8 @@
 #ifndef HW_ISA_NS87560_H
 #define HW_ISA_NS87560_H
 
+#include "hw/irq.h"
+#include "hw/isa/isa.h"
 #include "hw/pci/pci_device.h"
 #include "qom/object.h"
 
@@ -61,8 +63,15 @@ typedef enum NS87560IrqSource {
 struct NS87560LIOState {
     PCIDevice dev;
 
+    ISABus *isa_bus;
+    qemu_irq *isa_irqs;         /* 8259 inputs 0-15 */
+    ISADevice *pic[2];          /* master, slave */
+    IRQState i8259_irq;         /* target of the master's INT output */
     qemu_irq cascade_out;       /* 8259 master INT (CPUINT) */
+    qemu_irq bus_irqs[ISA_NUM_IRQS];
+    MemoryRegion pic_cmd_io[2]; /* ICW1.LTIM filter at 20h / A0h */
     uint32_t src_level;         /* bit n = level of NS87560IrqSource n */
+    uint16_t pic_level;         /* derived: level driven to each 8259 input */
     uint64_t unimp_logged;      /* config registers already reported */
 };
 

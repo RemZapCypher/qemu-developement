@@ -640,6 +640,7 @@ static void machine_HP_C3700_init(MachineState *machine)
     if (c3700_superio) {
         DeviceState *sio = qdev_new(TYPE_NS87560);
 
+        object_property_add_child(qdev_get_machine(), "ns87560", OBJECT(sio));
         object_property_set_link(OBJECT(sio), "bus", OBJECT(pci_bus),
                                  &error_abort);
         qdev_realize_and_unref(sio, NULL, &error_fatal);

@@ -17,6 +17,8 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "hw/irq.h"
+#include "hw/intc/i8259.h"
+#include "hw/isa/i8259_internal.h"
 #include "hw/isa/isa.h"
 #include "hw/isa/ns87560.h"
 #include "hw/pci/pci.h"
@@ -33,9 +35,18 @@
 #define NS87560_LIO_CMD_WMASK   0x014c  /* bits 2, 3, 6 and 8 are writable */
 #define NS87560_ACPIBAR_RESET   0x00000801  /* see ns87560_lio_regs[] */
 
+#define CFG_ELCR                0x67
+#define CFG_IRCR1               0x69
+#define CFG_IRCR9               0x71
 #define CFG_RSVD7E              0x7e
 #define CFG_ARB                 0x72
 #define NS87560_ARB_ROTATE      0x4688
+
+/* 8259 inputs the router may drive: 1, 3-7, 9-12, 14, 15 (p.268) */
+#define NS87560_IRQ_ROUTABLE    0xdefa
+/* ELCR: reserved bits 0, 2 (master) and IRQ8, IRQ13 (slave) */
+#define NS87560_ELCR_MASK_MASTER    0xfa
+#define NS87560_ELCR_MASK_SLAVE     0xde
 
 /*
  * Function 1 configuration registers 40h-FFh: reset value, writable bits
@@ -183,6 +194,111 @@ static void ns87560_lio_check_unimp(NS87560LIOState *s, uint32_t addr, int len)
     }
 }
 
+/* ---- Interrupt router (IRCR1-9, p.268-276) ----------------------------- */
+
+/* Source n is routed by nibble n % 2 of IRCR at 69h + n / 2; value = IRQ. */
+static int ns87560_route_of(NS87560LIOState *s, int src)
+{
+    int irq;
+
+    if (src == NS87560_SRC_RSVD) {
+        return 0;
+    }
+    irq = (s->dev.config[CFG_IRCR1 + src / 2] >> (4 * (src & 1))) & 0xf;
+    return (NS87560_IRQ_ROUTABLE & BIT(irq)) ? irq : 0;
+}
+
+/*
+ * Rebuild every 8259 input from the source levels and the routing, so a
+ * source moved away from an asserted input lowers it at once.
+ */
+static void ns87560_router_recompute(NS87560LIOState *s, bool force)
+{
+    uint16_t new = 0, changed;
+    int src, irq;
+
+    for (src = 0; src < NS87560_SRC_COUNT; src++) {
+        if (s->src_level & BIT(src)) {
+            irq = ns87560_route_of(s, src);
+            if (irq) {
+                new |= BIT(irq);
+            }
+        }
+    }
+    changed = force ? NS87560_IRQ_ROUTABLE : new ^ s->pic_level;
+    s->pic_level = new;
+    for (irq = 0; irq < ISA_NUM_IRQS; irq++) {
+        if (changed & BIT(irq)) {
+            trace_ns87560_router_pic(irq, !!(new & BIT(irq)));
+            qemu_set_irq(s->isa_irqs[irq], !!(new & BIT(irq)));
+        }
+    }
+}
+
+static void ns87560_router_set_irq(void *opaque, int src, int level)
+{
+    NS87560LIOState *s = opaque;
+
+    s->src_level = deposit32(s->src_level, src, 1, !!level);
+    trace_ns87560_router_source(src, !!level);
+    ns87560_router_recompute(s, false);
+}
+
+/* Trigger mode comes from config 67h/68h; the chip has no I/O 4D0h/4D1h. */
+static void ns87560_lio_update_elcr(NS87560LIOState *s)
+{
+    PICCommonState *m = PIC_COMMON(s->pic[0]);
+    PICCommonState *sl = PIC_COMMON(s->pic[1]);
+
+    m->elcr = s->dev.config[CFG_ELCR] & m->elcr_mask;
+    sl->elcr = s->dev.config[CFG_ELCR + 1] & sl->elcr_mask;
+    trace_ns87560_elcr(m->elcr, sl->elcr);
+    ns87560_router_recompute(s, true);
+}
+
+/*
+ * ICW1.LTIM is ignored by the chip (p.198): trigger mode is set only by
+ * the ELCR.  Filter it out before the command reaches QEMU's 8259.
+ */
+static uint64_t ns87560_pic_cmd_read(void *opaque, hwaddr addr, unsigned size)
+{
+    PICCommonState *p = opaque;
+    uint64_t v;
+
+    memory_region_dispatch_read(&p->base_io, 0, &v, MO_8,
+                                MEMTXATTRS_UNSPECIFIED);
+    return v;
+}
+
+static void ns87560_pic_cmd_write(void *opaque, hwaddr addr, uint64_t val,
+                                  unsigned size)
+{
+    PICCommonState *p = opaque;
+
+    if (val & 0x10) {           /* ICW1 */
+        val &= ~0x08;
+    }
+    memory_region_dispatch_write(&p->base_io, 0, val, MO_8,
+                                 MEMTXATTRS_UNSPECIFIED);
+}
+
+static const MemoryRegionOps ns87560_pic_cmd_ops = {
+    .read = ns87560_pic_cmd_read,
+    .write = ns87560_pic_cmd_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 1,
+};
+
+/* 8259 master INT = the chip's CPUINT pin */
+static void ns87560_lio_i8259_irq(void *opaque, int n, int level)
+{
+    NS87560LIOState *s = opaque;
+
+    trace_ns87560_cascade(level);
+    qemu_set_irq(s->cascade_out, level);
+}
+
 static void ns87560_lio_config_write(PCIDevice *d, uint32_t addr,
                                      uint32_t val, int len)
 {
@@ -205,21 +321,16 @@ static void ns87560_lio_config_write(PCIDevice *d, uint32_t addr,
             }
         }
     }
+    if (ranges_overlap(addr, len, CFG_ELCR, 2)) {
+        ns87560_lio_update_elcr(s);
+    }
+    if (ranges_overlap(addr, len, CFG_IRCR1, CFG_IRCR9 - CFG_IRCR1 + 1)) {
+        ns87560_router_recompute(s, false);
+    }
     ns87560_lio_check_unimp(s, addr, len);
 }
 
 /* ---- Function 1: legacy I/O bridge ------------------------------------ */
-
-static void ns87560_router_set_irq(void *opaque, int n, int level)
-{
-    NS87560LIOState *s = opaque;
-
-    if (level) {
-        s->src_level |= BIT(n);
-    } else {
-        s->src_level &= ~BIT(n);
-    }
-}
 
 static void ns87560_lio_instance_init(Object *obj)
 {
@@ -229,19 +340,86 @@ static void ns87560_lio_instance_init(Object *obj)
                             NS87560_LIO_GPIO_ROUTER, NS87560_SRC_COUNT);
     qdev_init_gpio_out_named(DEVICE(obj), &s->cascade_out,
                              NS87560_LIO_GPIO_INTR, 1);
+    qemu_init_irq(&s->i8259_irq, ns87560_lio_i8259_irq, s, 0);
 }
 
 static void ns87560_lio_realize(PCIDevice *d, Error **errp)
 {
     NS87560LIOState *s = NS87560_LIO(d);
+    MemoryRegion *io = pci_address_space_io(d);
+    BusChild *kid;
+    int i;
 
     ns87560_lio_init_masks(s);
     ns87560_lio_config_defaults(s);
+
+    /* QEMU supports one ISA bus per machine; this fails on the B160L. */
+    s->isa_bus = isa_bus_new(DEVICE(d), pci_address_space(d), io, errp);
+    if (!s->isa_bus) {
+        return;
+    }
+
+    s->isa_irqs = i8259_init(s->isa_bus, &s->i8259_irq);
+    s->pic[0] = ISA_DEVICE(isa_pic);
+    QTAILQ_FOREACH(kid, &BUS(s->isa_bus)->children, sibling) {
+        Object *o = OBJECT(kid->child);
+
+        if (object_dynamic_cast(o, TYPE_PIC_COMMON) &&
+            !PIC_COMMON(o)->master) {
+            s->pic[1] = ISA_DEVICE(o);
+        }
+    }
+    assert(s->pic[1]);
+    for (i = 0; i < 2; i++) {
+        PICCommonState *p = PIC_COMMON(s->pic[i]);
+
+        memory_region_set_enabled(&p->elcr_io, false);
+        /* QEMU's F8h would keep IRQ1 edge-triggered; Linux needs level. */
+        p->elcr_mask = i ? NS87560_ELCR_MASK_SLAVE : NS87560_ELCR_MASK_MASTER;
+        memory_region_init_io(&s->pic_cmd_io[i], OBJECT(d), &ns87560_pic_cmd_ops,
+                              p, i ? "ns87560-pic2-cmd" : "ns87560-pic1-cmd", 1);
+        memory_region_add_subregion_overlap(io, i ? 0xa0 : 0x20,
+                                            &s->pic_cmd_io[i], 1);
+    }
+
+    /* Fixed 8259 inputs; routed peripherals are connected later. */
+    s->bus_irqs[0] = s->isa_irqs[0];
+    s->bus_irqs[8] = s->isa_irqs[8];
+    s->bus_irqs[13] = s->isa_irqs[13];
+    isa_bus_register_input_irqs(s->isa_bus, s->bus_irqs);
+
+    ns87560_lio_update_elcr(s);
 }
 
 static void ns87560_lio_reset_hold(Object *obj, ResetType type)
 {
-    ns87560_lio_config_defaults(NS87560_LIO(obj));
+    NS87560LIOState *s = NS87560_LIO(obj);
+
+    ns87560_lio_config_defaults(s);
+    ns87560_lio_update_elcr(s);
+}
+
+static int ns87560_lio_post_load(void *opaque, int version_id)
+{
+    NS87560LIOState *s = opaque;
+    int src, irq;
+
+    /*
+     * The PICs migrate their own state; only rebuild the bookkeeping, do
+     * not drive their inputs again.
+     */
+    s->pic_level = 0;
+    for (src = 0; src < NS87560_SRC_COUNT; src++) {
+        irq = ns87560_route_of(s, src);
+        if ((s->src_level & BIT(src)) && irq) {
+            s->pic_level |= BIT(irq);
+        }
+    }
+    PIC_COMMON(s->pic[0])->elcr = s->dev.config[CFG_ELCR] &
+                                  PIC_COMMON(s->pic[0])->elcr_mask;
+    PIC_COMMON(s->pic[1])->elcr = s->dev.config[CFG_ELCR + 1] &
+                                  PIC_COMMON(s->pic[1])->elcr_mask;
+    return 0;
 }
 
 /*
@@ -260,6 +438,7 @@ static const VMStateDescription vmstate_ns87560_lio = {
     .name = "ns87560-lio",
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = ns87560_lio_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_PCI_DEVICE(dev, NS87560LIOState),
         VMSTATE_UINT32(src_level, NS87560LIOState),

@@ -29,3 +29,7 @@ ich9_cc_read(uint64_t addr, uint64_t val, unsigned len) "addr=0x%"PRIx64 " val=0
 
 # ns87560.c
 ns87560_lio_config_write(uint32_t addr, uint32_t val, int len) "addr 0x%02x val 0x%x len %d"
+ns87560_router_source(int src, int level) "source %d level %d"
+ns87560_router_pic(int irq, int level) "pic input %d level %d"
+ns87560_elcr(uint8_t master, uint8_t slave) "elcr master 0x%02x slave 0x%02x"
+ns87560_cascade(int level) "CPUINT level %d"

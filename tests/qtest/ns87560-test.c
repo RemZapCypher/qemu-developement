@@ -16,6 +16,11 @@
 #define ELROY_CFG_ADDR      0x40
 #define ELROY_CFG_DATA      0x48
 
+/* Elroy 0 PCI I/O space: port N at ELROY0_IO + N */
+#define ELROY0_IO           0xfffffffffee00000ULL
+#define LIO_PATH            "/machine/ns87560/lio"
+#define SRC_SP1             0
+
 #define NS87560_SLOT        0x0e
 #define CFG(fn, off)        ((NS87560_SLOT << 11) | ((fn) << 8) | (off))
 
@@ -132,6 +137,67 @@ static void test_lio_masks(void)
     qtest_quit(qts);
 }
 
+static void outb(QTestState *qts, uint16_t port, uint8_t val)
+{
+    qtest_writeb(qts, ELROY0_IO + port, val);
+}
+
+static uint8_t inb(QTestState *qts, uint16_t port)
+{
+    return qtest_readb(qts, ELROY0_IO + port);
+}
+
+/* Router -> 8259 -> CPUINT, acknowledge by POLL + specific EOI (Linux) */
+static void test_irq_route(void)
+{
+    QTestState *qts = qtest_init("-machine C3700,superio=on -nodefaults");
+
+    qtest_irq_intercept_out_named(qts, LIO_PATH, "intr");
+    /* 8259 setup as in drivers/parisc/superio.c; IRQ0 masked */
+    outb(qts, 0x20, 0x11); outb(qts, 0x21, 0x00);
+    outb(qts, 0x21, 0x04); outb(qts, 0x21, 0x01);
+    outb(qts, 0x21, 0x01);
+    outb(qts, 0xa0, 0x11); outb(qts, 0xa1, 0x08);
+    outb(qts, 0xa1, 0x02); outb(qts, 0xa1, 0x01);
+    outb(qts, 0xa1, 0xff);
+    /* IRQ3 level-triggered, SP1 -> IRQ3 */
+    cfg_writel(qts, 1, 0x64, 0x08000000);
+    cfg_writel(qts, 1, 0x68, 0x07654300);
+    g_assert_false(qtest_get_irq(qts, 0));
+
+    qtest_set_irq_in(qts, LIO_PATH, "router-in", SRC_SP1, 1);
+    g_assert_true(qtest_get_irq(qts, 0));
+    outb(qts, 0x20, 0x0c);                       /* OCW3: poll */
+    g_assert_cmphex(inb(qts, 0x20), ==, 0x83);
+    qtest_set_irq_in(qts, LIO_PATH, "router-in", SRC_SP1, 0);
+    outb(qts, 0x20, 0x63);                       /* specific EOI IRQ3 */
+    g_assert_false(qtest_get_irq(qts, 0));
+
+    /* Rerouting an asserted source away lowers the 8259 input */
+    qtest_set_irq_in(qts, LIO_PATH, "router-in", SRC_SP1, 1);
+    g_assert_true(qtest_get_irq(qts, 0));
+    cfg_writel(qts, 1, 0x68, 0x07654000);        /* SP1 not routed */
+    g_assert_false(qtest_get_irq(qts, 0));
+    qtest_quit(qts);
+}
+
+/* ICW1.LTIM is ignored: trigger mode comes only from the ELCR */
+static void test_irq_ltim_ignored(void)
+{
+    QTestState *qts = qtest_init("-machine C3700,superio=on -nodefaults");
+
+    qtest_irq_intercept_out_named(qts, LIO_PATH, "intr");
+    outb(qts, 0x20, 0x19); outb(qts, 0x21, 0x00);  /* ICW1 with LTIM */
+    outb(qts, 0x21, 0x04); outb(qts, 0x21, 0x01);
+    outb(qts, 0x21, 0x01);
+    cfg_writel(qts, 1, 0x68, 0x07654300);         /* SP1 -> IRQ3, edge */
+    qtest_set_irq_in(qts, LIO_PATH, "router-in", SRC_SP1, 1);
+    qtest_set_irq_in(qts, LIO_PATH, "router-in", SRC_SP1, 0);
+    /* Edge-triggered: the request stays latched after the input drops */
+    g_assert_true(qtest_get_irq(qts, 0));
+    qtest_quit(qts);
+}
+
 static void test_superio_off(void)
 {
     QTestState *qts = qtest_init("-machine C3700 -nodefaults");
@@ -153,5 +219,7 @@ int main(int argc, char **argv)
     qtest_add_func("/ns87560/lio-reset", test_lio_reset);
     qtest_add_func("/ns87560/lio-linux-writes", test_lio_linux_writes);
     qtest_add_func("/ns87560/lio-masks", test_lio_masks);
+    qtest_add_func("/ns87560/irq-route", test_irq_route);
+    qtest_add_func("/ns87560/irq-ltim-ignored", test_irq_ltim_ignored);
     return g_test_run();
 }
