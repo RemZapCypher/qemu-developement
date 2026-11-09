@@ -26,6 +26,14 @@ static void ns87415_realize(PCIDevice *dev, Error **errp)
     uint8_t *c = dev->config;
 
     c[PCI_CLASS_PROG] = NS87415_PROGIF;
+    /* Channel 1 and 2 legacy/native mode bits (p.89) */
+    dev->wmask[PCI_CLASS_PROG] = 0x05;
+    /*
+     * NS registers 40h-5Dh are not modelled yet: keep them read-only 0.
+     * In particular 43h bits 0-1 must read 0, or Linux waits forever.
+     */
+    memset(dev->wmask + PCI_CONFIG_HEADER_SIZE, 0,
+           PCI_CONFIG_SPACE_SIZE - PCI_CONFIG_HEADER_SIZE);
     /* Interrupts go through the chip's router, never to a PCI pin. */
     c[PCI_INTERRUPT_PIN] = 0;
 }

@@ -268,6 +268,19 @@ static void test_irq_two_sources(void)
     qtest_quit(qts);
 }
 
+/* Linux superio_fixup_pci() switches both IDE channels to native mode */
+static void test_ide_progif(void)
+{
+    QTestState *qts = qtest_init("-machine C3700,superio=ns87560 -nodefaults");
+
+    cfg_writel(qts, 0, 0x08, 0xffffffff);
+    g_assert_cmphex(cfg_readl(qts, 0, 0x08), ==, 0x01018f03);
+    cfg_writel(qts, 0, 0x40, 0xffffffff);
+    g_assert_cmphex(cfg_readb(qts, 0, 0x43) & 3, ==, 0);
+    g_assert_cmphex((cfg_readl(qts, 0, 0x3c) >> 8) & 0xff, ==, 0);
+    qtest_quit(qts);
+}
+
 /* SP1 base register relocates the UART; 5Ah bit 1 disables it */
 static void test_uart_relocate(void)
 {
@@ -332,6 +345,7 @@ int main(int argc, char **argv)
     qtest_add_func("/ns87560/irq-ltim-ignored", test_irq_ltim_ignored);
     qtest_add_func("/ns87560/irq-two-sources", test_irq_two_sources);
     qtest_add_func("/ns87560/uart-relocate", test_uart_relocate);
+    qtest_add_func("/ns87560/ide-progif", test_ide_progif);
     qtest_add_func("/ns87560/acpi-usbreg", test_acpi_usbreg);
     qtest_add_func("/ns87560/acpi-usbreg-defaults", test_acpi_usbreg_defaults);
     return g_test_run();
