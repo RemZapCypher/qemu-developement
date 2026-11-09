@@ -299,6 +299,99 @@ static void test_ide_progif(void)
 }
 
 /* SP1 base register relocates the UART; 5Ah bit 1 disables it */
+#define IDE_PATH        "/machine/ns87560/ide"
+#define IDE_ARGS        "-machine C3700,superio=on -nodefaults " \
+                        "-drive if=ide,index=0,file=null-co://,format=raw"
+#define IDE_CMD_BASE    0x1000
+#define IDE_CTL_BASE    0x1010
+#define IDE_BM_BASE     0x1020
+
+/* Channel 1 to native mode at IDE_CMD_BASE / IDE_CTL_BASE / IDE_BM_BASE */
+static void ide_go_native(QTestState *qts)
+{
+    cfg_writel(qts, 0, 0x10, IDE_CMD_BASE);
+    cfg_writel(qts, 0, 0x14, IDE_CTL_BASE);
+    cfg_writel(qts, 0, 0x20, IDE_BM_BASE);
+    cfg_writel(qts, 0, 0x08, 0x01018f00);
+}
+
+/* BAR and NS register reset values, write masks (PC87560UBD ch. 5) */
+static void test_ide_regs(void)
+{
+    QTestState *qts = qtest_init(IDE_ARGS);
+    static const uint32_t bars[] = {
+        0xfffffff9, 0xfffffffd, 0xfffffff9, 0xfffffffd, 0xfffffff1
+    };
+    int i;
+
+    for (i = 0; i < 5; i++) {
+        g_assert_cmphex(cfg_readl(qts, 0, 0x10 + 4 * i), ==, bars[i]);
+    }
+    g_assert_cmphex(cfg_readl(qts, 0, 0x04) & 0xffff, ==, 0x0005);
+    g_assert_cmphex(cfg_readl(qts, 0, 0x40), ==, 0x00000000);
+    g_assert_cmphex(cfg_readl(qts, 0, 0x44), ==, 0x00008585);
+    g_assert_cmphex(cfg_readl(qts, 0, 0x54), ==, 0x0000eeb7);
+    /* 44h/45h are timing registers; 46h/47h are reserved */
+    cfg_writel(qts, 0, 0x44, 0xffffffff);
+    g_assert_cmphex(cfg_readl(qts, 0, 0x44), ==, 0x0000ffff);
+    /* 40h: bits 1,4-7; 41h: bits 0-5; 42h: all but bit 2; 43h read-only */
+    cfg_writel(qts, 0, 0x40, 0xffffffff);
+    g_assert_cmphex(cfg_readl(qts, 0, 0x40), ==, 0x00fb3ff2);
+    qtest_quit(qts);
+}
+
+/* Legacy ports, 5Ah channel enable, native BARs (PC87560UBD ch. 5, 20) */
+static void test_ide_decode(void)
+{
+    QTestState *qts = qtest_init(IDE_ARGS);
+    uint32_t fer = cfg_readl(qts, 1, 0x58);
+
+    g_assert_cmphex(inb(qts, 0x1f7), ==, 0x50);
+    cfg_writel(qts, 1, 0x58, fer & ~(1u << 18)  /* 5Ah bit 2 */);
+    g_assert_cmphex(inb(qts, 0x1f7), ==, 0xff);
+    cfg_writel(qts, 1, 0x58, fer);
+    g_assert_cmphex(inb(qts, 0x1f7), ==, 0x50);
+
+    ide_go_native(qts);
+    g_assert_cmphex(cfg_readb(qts, 0, 0x09), ==, 0x8f);
+    g_assert_cmphex(inb(qts, 0x1f7), ==, 0xff);
+    g_assert_cmphex(inb(qts, IDE_CMD_BASE + 7), ==, 0x50);
+    g_assert_cmphex(inb(qts, IDE_CTL_BASE + 2), ==, 0x50);
+    /* Native mode is gated by 5Ah too */
+    cfg_writel(qts, 1, 0x58, fer & ~(1u << 18)  /* 5Ah bit 2 */);
+    g_assert_cmphex(inb(qts, IDE_CMD_BASE + 7), ==, 0xff);
+    qtest_quit(qts);
+}
+
+/*
+ * Drive interrupt: sets BM status Interrupt, reaches the router unless
+ * 41h masks it, and BM command bit 2 clears the status bit (erratum).
+ */
+static void test_ide_irq_erratum(void)
+{
+    QTestState *qts = qtest_init(IDE_ARGS);
+
+    qtest_irq_intercept_out_named(qts, IDE_PATH, "isa-irq");
+    ide_go_native(qts);
+    outb(qts, IDE_CMD_BASE + 6, 0xa0);
+    outb(qts, IDE_CMD_BASE + 7, 0xec);              /* IDENTIFY DEVICE */
+    g_assert_true(qtest_get_irq(qts, 0));
+    g_assert_cmphex(inb(qts, IDE_BM_BASE + 2) & 0x04, ==, 0x04);
+
+    cfg_writel(qts, 0, 0x40, 0x00000100);           /* 41h: mask ch1 */
+    g_assert_false(qtest_get_irq(qts, 0));
+    cfg_writel(qts, 0, 0x40, 0);
+    g_assert_true(qtest_get_irq(qts, 0));
+
+    outb(qts, IDE_BM_BASE, 0x04);
+    g_assert_cmphex(inb(qts, IDE_BM_BASE + 2) & 0x04, ==, 0);
+    g_assert_cmphex(inb(qts, IDE_BM_BASE), ==, 0);   /* bits 1/2 read 0 */
+
+    inb(qts, IDE_CMD_BASE + 7);                       /* status read acks */
+    g_assert_false(qtest_get_irq(qts, 0));
+    qtest_quit(qts);
+}
+
 static void test_uart_relocate(void)
 {
     QTestState *qts = qtest_init("-machine C3700,superio=on -nodefaults");
@@ -363,6 +456,9 @@ int main(int argc, char **argv)
     qtest_add_func("/ns87560/irq-two-sources", test_irq_two_sources);
     qtest_add_func("/ns87560/uart-relocate", test_uart_relocate);
     qtest_add_func("/ns87560/ide-progif", test_ide_progif);
+    qtest_add_func("/ns87560/ide-regs", test_ide_regs);
+    qtest_add_func("/ns87560/ide-decode", test_ide_decode);
+    qtest_add_func("/ns87560/ide-irq-erratum", test_ide_irq_erratum);
     qtest_add_func("/ns87560/acpi-usbreg", test_acpi_usbreg);
     qtest_add_func("/ns87560/acpi-usbreg-defaults", test_acpi_usbreg_defaults);
     return g_test_run();
