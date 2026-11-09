@@ -396,12 +396,23 @@ static void elroy_set_irq(void *opaque, int irq, int level)
     }
 }
 
+/*
+ * SeaBIOS-hppa builds the interrupt routing table it hands to the OS by
+ * giving each PCI function on the bus the next IOSAPIC input, in devfn
+ * order (iosapic_table_setup()).  Route INTx to that same input.
+ */
 static int elroy_pci_map_irq(PCIDevice *d, int irq_num)
 {
-    int slot = PCI_SLOT(d->devfn);
+    PCIBus *bus = pci_get_bus(d);
+    int devfn, n = 0;
 
-    assert(irq_num >= 0 && irq_num < ELROY_IRQS);
-    return slot & (ELROY_IRQS - 1);
+    assert(irq_num >= 0 && irq_num < PCI_NUM_PINS);
+    for (devfn = 0; devfn < d->devfn; devfn++) {
+        if (bus->devices[devfn]) {
+            n++;
+        }
+    }
+    return n & (ELROY_IRQS - 1);
 }
 
 static void elroy_reset(DeviceState *dev)

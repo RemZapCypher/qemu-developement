@@ -26,7 +26,6 @@
 #define IOSAPIC_REG_SELECT  0x800
 #define IOSAPIC_REG_WINDOW  0x810
 #define IOSAPIC_REG_EOI     0x840
-#define NS87560_IOSAPIC_IN  (NS87560_SLOT & 7)   /* Elroy maps slot & 7 */
 
 #define NS87560_SLOT        0x0e
 #define CFG(fn, off)        ((NS87560_SLOT << 11) | ((fn) << 8) | (off))
@@ -210,10 +209,28 @@ static void elroy_writel(QTestState *qts, int reg, uint32_t val)
     qtest_writel(qts, ELROY0_HPA + reg, bswap32(val));
 }
 
-/* Point Elroy input 6 at the CPU with vector @vec, enabled. */
+/*
+ * Elroy input of fn2 (which carries the 8259 INT): one input per present
+ * PCI function, in devfn order, as SeaBIOS-hppa's routing table assigns.
+ */
+static int ns87560_iosapic_in(QTestState *qts)
+{
+    int devfn, n = 0;
+
+    for (devfn = 0; devfn < ((NS87560_SLOT << 3) | 2); devfn++) {
+        qtest_writel(qts, ELROY0_HPA + ELROY_CFG_ADDR, bswap32(devfn << 8));
+        if ((bswap32(qtest_readl(qts, ELROY0_HPA + ELROY_CFG_DATA)) & 0xffff)
+            != 0xffff) {
+            n++;
+        }
+    }
+    return n & 7;
+}
+
+/* Point fn2's Elroy input at the CPU with vector @vec, enabled. */
 static void iosapic_set_vector(QTestState *qts, int vec)
 {
-    elroy_writel(qts, IOSAPIC_REG_SELECT, 0x10 + 2 * NS87560_IOSAPIC_IN);
+    elroy_writel(qts, IOSAPIC_REG_SELECT, 0x10 + 2 * ns87560_iosapic_in(qts));
     elroy_writel(qts, IOSAPIC_REG_WINDOW, vec);
 }
 
