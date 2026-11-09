@@ -20,6 +20,13 @@
 #define ELROY0_IO           0xfffffffffee00000ULL
 #define LIO_PATH            "/machine/ns87560/lio"
 #define SRC_SP1             0
+#define SRC_SP2             1
+
+/* Elroy IOSAPIC registers (hw/pci-host/astro.c) */
+#define IOSAPIC_REG_SELECT  0x800
+#define IOSAPIC_REG_WINDOW  0x810
+#define IOSAPIC_REG_EOI     0x840
+#define NS87560_IOSAPIC_IN  (NS87560_SLOT & 7)   /* Elroy maps slot & 7 */
 
 #define NS87560_SLOT        0x0e
 #define CFG(fn, off)        ((NS87560_SLOT << 11) | ((fn) << 8) | (off))
@@ -198,6 +205,69 @@ static void test_irq_ltim_ignored(void)
     qtest_quit(qts);
 }
 
+static void elroy_writel(QTestState *qts, int reg, uint32_t val)
+{
+    qtest_writel(qts, ELROY0_HPA + reg, bswap32(val));
+}
+
+/* Point Elroy input 6 at the CPU with vector @vec, enabled. */
+static void iosapic_set_vector(QTestState *qts, int vec)
+{
+    elroy_writel(qts, IOSAPIC_REG_SELECT, 0x10 + 2 * NS87560_IOSAPIC_IN);
+    elroy_writel(qts, IOSAPIC_REG_WINDOW, vec);
+}
+
+/* The CPU does not run under qtest, so EIRR only accumulates bits. */
+static uint64_t cpu_eirr(QTestState *qts)
+{
+    g_autofree char *regs = qtest_hmp(qts, "info registers");
+    char *p = strstr(regs, "EIRR ");
+
+    g_assert_nonnull(p);
+    return g_ascii_strtoull(p + 5, NULL, 16);
+}
+
+#define EIRR_BIT(vec)   (1ull << (31 - (vec)))
+
+/*
+ * Two interrupts pending at once: the second must reach the CPU after
+ * Linux services the first (poll, specific EOI, IOSAPIC EOI).
+ */
+static void test_irq_two_sources(void)
+{
+    QTestState *qts = qtest_init("-machine C3700,superio=on -nodefaults");
+
+    /* 8259 setup exactly as drivers/parisc/superio.c */
+    outb(qts, 0x20, 0x11); outb(qts, 0x21, 0x00);
+    outb(qts, 0x21, 0x04); outb(qts, 0x21, 0x01);
+    outb(qts, 0x21, 0xff); outb(qts, 0x20, 0xc2);
+    outb(qts, 0xa0, 0x11); outb(qts, 0xa1, 0x00);
+    outb(qts, 0xa1, 0x02); outb(qts, 0xa1, 0x01);
+    outb(qts, 0x21, 0xff); outb(qts, 0x20, 0x68);
+    outb(qts, 0x21, 0xe7);                      /* unmask IRQ3, IRQ4 */
+    cfg_writel(qts, 1, 0x68, 0x07654300);       /* SP1 -> 3, SP2 -> 4 */
+    iosapic_set_vector(qts, 5);
+    g_assert_cmphex(cpu_eirr(qts) & EIRR_BIT(5), ==, 0);
+
+    qtest_set_irq_in(qts, LIO_PATH, "router-in", SRC_SP1, 1);
+    qtest_set_irq_in(qts, LIO_PATH, "router-in", SRC_SP2, 1);
+    g_assert_cmphex(cpu_eirr(qts) & EIRR_BIT(5), !=, 0);
+
+    /* A different vector makes the second delivery visible. */
+    iosapic_set_vector(qts, 6);
+    outb(qts, 0x20, 0x0c);
+    g_assert_cmphex(inb(qts, 0x20), ==, 0x83);
+    qtest_set_irq_in(qts, LIO_PATH, "router-in", SRC_SP1, 0);
+    g_assert_cmphex(cpu_eirr(qts) & EIRR_BIT(6), ==, 0);
+    outb(qts, 0x20, 0x63);                      /* specific EOI IRQ3 */
+    elroy_writel(qts, IOSAPIC_REG_EOI, 6);
+    g_assert_cmphex(cpu_eirr(qts) & EIRR_BIT(6), !=, 0);
+
+    outb(qts, 0x20, 0x0c);
+    g_assert_cmphex(inb(qts, 0x20), ==, 0x84);
+    qtest_quit(qts);
+}
+
 static void test_superio_off(void)
 {
     QTestState *qts = qtest_init("-machine C3700 -nodefaults");
@@ -221,5 +291,6 @@ int main(int argc, char **argv)
     qtest_add_func("/ns87560/lio-masks", test_lio_masks);
     qtest_add_func("/ns87560/irq-route", test_irq_route);
     qtest_add_func("/ns87560/irq-ltim-ignored", test_irq_ltim_ignored);
+    qtest_add_func("/ns87560/irq-two-sources", test_irq_two_sources);
     return g_test_run();
 }
