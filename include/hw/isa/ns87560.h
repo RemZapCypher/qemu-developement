@@ -63,6 +63,7 @@ struct NS87560LIOState {
 
     qemu_irq cascade_out;       /* 8259 master INT (CPUINT) */
     uint32_t src_level;         /* bit n = level of NS87560IrqSource n */
+    uint64_t unimp_logged;      /* config registers already reported */
 };
 
 struct NS87560State {
