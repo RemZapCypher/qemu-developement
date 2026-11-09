@@ -403,9 +403,12 @@ static void machine_HP_common_init_tail(MachineState *machine, PCIBus *pci_bus,
 
             /* bind default keyboard/serial to Diva card */
             qdev_prop_set_chr(DEVICE(pci_dev), "chardev1", serial_hd(first));
-            qdev_prop_set_chr(DEVICE(pci_dev), "chardev2", serial_hd(first + 1));
-            qdev_prop_set_chr(DEVICE(pci_dev), "chardev3", serial_hd(first + 2));
-            qdev_prop_set_chr(DEVICE(pci_dev), "chardev4", serial_hd(first + 3));
+            qdev_prop_set_chr(DEVICE(pci_dev), "chardev2",
+                              serial_hd(first + 1));
+            qdev_prop_set_chr(DEVICE(pci_dev), "chardev3",
+                              serial_hd(first + 2));
+            qdev_prop_set_chr(DEVICE(pci_dev), "chardev4",
+                              serial_hd(first + 3));
         }
         pci_realize_and_unref(pci_dev, pci_bus, &error_fatal);
     }

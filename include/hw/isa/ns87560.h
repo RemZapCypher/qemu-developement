@@ -76,7 +76,7 @@ typedef struct NS87560SCCState {
     uint8_t excr1;
     uint8_t excr2;
     uint8_t ier_ext;            /* IER bits 7:4, extended mode only */
-    uint8_t scratch[2];         /* bank 1 offsets 0/1 while the divisor is locked */
+    uint8_t scratch[2];         /* bank 1 offsets 0/1, divisor locked */
     uint8_t ir[10];             /* SCC2 infrared registers, banks 4-7 */
 } NS87560SCCState;
 
