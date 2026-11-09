@@ -9,6 +9,7 @@
 #ifndef HW_ISA_NS87560_H
 #define HW_ISA_NS87560_H
 
+#include "hw/dma/i8257.h"
 #include "hw/irq.h"
 #include "hw/isa/isa.h"
 #include "hw/pci/pci_device.h"
@@ -81,6 +82,15 @@ struct NS87560LIOState {
     uint32_t src_level;         /* bit n = level of NS87560IrqSource n */
     uint16_t pic_level;         /* derived: level driven to each 8259 input */
     uint64_t unimp_logged;      /* config registers already reported */
+    ISADevice *fdc;
+    I8257State *dma[2];         /* channels 0-3, 4-7 */
+    MemoryRegion dma_hipage_io; /* 480h-48Fh; values live in the i8257s */
+    MemoryRegion fdccfg_idx_io;     /* FDCBAR+0: SRA, config index */
+    MemoryRegion fdccfg_data_io;    /* FDCBAR+1 in config mode */
+    uint8_t fdccfg[10];
+    uint8_t fdccfg_index;
+    bool fdccfg_mode;
+    int fdc_dma;                /* FDC DMA channel bound at realize */
     NS87560DecodeNotify ide_notify;     /* set by function 0 */
     PCIDevice *ide;
 };

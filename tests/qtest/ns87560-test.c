@@ -453,6 +453,82 @@ static void test_usb_regs(void)
     qtest_quit(qts);
 }
 
+static uint8_t fdc_cmd(QTestState *qts, const uint8_t *bytes, int n)
+{
+    int i;
+
+    for (i = 0; i < n; i++) {
+        outb(qts, 0x3f5, bytes[i]);
+    }
+    return inb(qts, 0x3f4);                     /* MSR */
+}
+
+/* NSC commands of the PC87560 FDC (p.117): PART ID 73h, MODE */
+static void test_fdc_commands(void)
+{
+    QTestState *qts = qtest_init("-machine C3700,superio=on -nodefaults");
+    static const uint8_t partid[] = { 0x18 };
+    static const uint8_t version[] = { 0x10 };
+    static const uint8_t mode[] = { 0x01, 0x00, 0x00, 0xc8, 0x00 };
+
+    g_assert_cmphex(fdc_cmd(qts, partid, 1) & 0xd0, ==, 0xd0);
+    g_assert_cmphex(inb(qts, 0x3f5), ==, 0x73);
+    fdc_cmd(qts, version, 1);
+    g_assert_cmphex(inb(qts, 0x3f5), ==, 0x90);
+    /* MODE takes four parameters and has no result phase */
+    g_assert_cmphex(fdc_cmd(qts, mode, 5), ==, 0x80);
+    qtest_quit(qts);
+}
+
+/* FDC configuration mode (p.95-96): 5Dh bit 0, then 55h / AAh at FDCBAR */
+static void test_fdc_config_mode(void)
+{
+    QTestState *qts = qtest_init("-machine C3700,superio=on -nodefaults");
+
+    outb(qts, 0x3f0, 0x55);                     /* 5Dh bit 0 clear: ignored */
+    outb(qts, 0x3f0, 0x00);
+    g_assert_cmphex(inb(qts, 0x3f1), !=, 0x10);
+
+    cfg_writel(qts, 1, 0x5c, 0x00000100);       /* 5Dh bit 0 */
+    outb(qts, 0x3f0, 0x55);
+    outb(qts, 0x3f0, 0x00);
+    g_assert_cmphex(inb(qts, 0x3f1), ==, 0x10); /* FDCDID */
+    outb(qts, 0x3f0, 0x07);
+    g_assert_cmphex(inb(qts, 0x3f1), ==, 0x05);
+    outb(qts, 0x3f1, 0x12);
+    g_assert_cmphex(inb(qts, 0x3f1), ==, 0x12);
+    outb(qts, 0x3f0, 0x00);
+    outb(qts, 0x3f1, 0xff);                     /* FDCDID is read-only */
+    g_assert_cmphex(inb(qts, 0x3f1), ==, 0x10);
+    outb(qts, 0x3f0, 0xaa);
+    g_assert_cmphex(inb(qts, 0x3f1), !=, 0x10);
+    qtest_quit(qts);
+}
+
+/* 8237 high pages 480h-48Fh, cleared by low page or base writes (p.160-166) */
+static void test_dma_hipage(void)
+{
+    QTestState *qts = qtest_init("-machine C3700,superio=on -nodefaults");
+    uint32_t fer;
+
+    outb(qts, 0x483, 0x12);                     /* channel 1 */
+    g_assert_cmphex(inb(qts, 0x483), ==, 0x12);
+    outb(qts, 0x83, 0x05);                      /* its low page */
+    g_assert_cmphex(inb(qts, 0x483), ==, 0);
+
+    outb(qts, 0x48b, 0x34);                     /* channel 5 */
+    g_assert_cmphex(inb(qts, 0x48b), ==, 0x34);
+    outb(qts, 0xc4, 0x00);                      /* its base address */
+    g_assert_cmphex(inb(qts, 0x48b), ==, 0);
+    g_assert_cmphex(inb(qts, 0x484), ==, 0);    /* unused offset */
+
+    fer = cfg_readl(qts, 1, 0x58);
+    cfg_writel(qts, 1, 0x58, fer & ~(1u << 27));    /* 5Ah bit 11: 8237 #1 */
+    outb(qts, 0x483, 0x56);
+    g_assert_cmphex(inb(qts, 0x483), ==, 0xff);
+    qtest_quit(qts);
+}
+
 static void test_uart_relocate(void)
 {
     QTestState *qts = qtest_init("-machine C3700,superio=on -nodefaults");
@@ -522,6 +598,9 @@ int main(int argc, char **argv)
     qtest_add_func("/ns87560/ide-irq-erratum", test_ide_irq_erratum);
     qtest_add_func("/ns87560/usb-config", test_usb_config);
     qtest_add_func("/ns87560/usb-regs", test_usb_regs);
+    qtest_add_func("/ns87560/fdc-commands", test_fdc_commands);
+    qtest_add_func("/ns87560/fdc-config-mode", test_fdc_config_mode);
+    qtest_add_func("/ns87560/dma-hipage", test_dma_hipage);
     qtest_add_func("/ns87560/acpi-usbreg", test_acpi_usbreg);
     qtest_add_func("/ns87560/acpi-usbreg-defaults", test_acpi_usbreg_defaults);
     return g_test_run();

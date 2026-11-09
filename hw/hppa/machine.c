@@ -30,6 +30,8 @@
 #include "hw/pci-host/dino.h"
 #include "hw/isa/ns87560.h"
 #include "hw/ide/pci.h"
+#include "hw/block/fdc.h"
+#include "system/blockdev.h"
 #include "hw/misc/lasi.h"
 #include "hppa_hardware.h"
 #include "qemu/units.h"
@@ -647,6 +649,8 @@ static void machine_HP_C3700_init(MachineState *machine)
     /* Before the tail, which places devices at the lowest free slots */
     if (c3700_superio) {
         DeviceState *sio = qdev_new(TYPE_NS87560);
+        DriveInfo *fd[MAX_FD];
+        int i;
 
         object_property_add_child(qdev_get_machine(), "ns87560", OBJECT(sio));
         object_property_set_link(OBJECT(sio), "bus", OBJECT(pci_bus),
@@ -656,6 +660,10 @@ static void machine_HP_C3700_init(MachineState *machine)
         qdev_prop_set_chr(sio, "chardev-pp", parallel_hds[0]);
         qdev_realize_and_unref(sio, NULL, &error_fatal);
         pci_ide_create_devs(NS87560(sio)->ide);
+        for (i = 0; i < MAX_FD; i++) {
+            fd[i] = drive_get(IF_FLOPPY, 0, i);
+        }
+        isa_fdc_init_drives(NS87560(sio)->lio->fdc, fd);
     }
 
     /* Add SCSI discs, NICs, graphics & load firmware */

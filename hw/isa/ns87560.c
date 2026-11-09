@@ -20,6 +20,7 @@
 #include "chardev/char-fe.h"
 #include "hw/char/parallel-isa.h"
 #include "hw/char/serial-isa.h"
+#include "hw/block/fdc.h"
 #include "hw/intc/i8259.h"
 #include "hw/isa/i8259_internal.h"
 #include "hw/isa/isa.h"
@@ -39,12 +40,21 @@
 #define NS87560_ACPIBAR_RESET   0x00000801  /* see ns87560_lio_regs[] */
 
 #define CFG_FER                 0x5a
+#define FER_FDC                 BIT(0)
 #define FER_SP1                 BIT(1)
 #define FER_IDE1                BIT(2)
 #define FER_SP2                 BIT(3)
 #define FER_IDE2                BIT(4)
 #define FER_PP                  BIT(5)
 #define FER_PIC                 BIT(9)
+#define FER_DMA1                BIT(11)
+#define FER_DMA2                BIT(12)
+#define CFG_SFE                 0x5d
+#define SFE_FDC_CFG             BIT(0)
+#define CFG_DMART1              0x63
+#define CFG_FDCBAR              0x90
+#define NS87560_FDC_DID         0x10
+#define NS87560_FDC_PARTID      0x73
 #define CFG_ACPIBAR             0x88
 #define CFG_SP1BAR              0x94
 #define CFG_SP2BAR              0x98
@@ -337,9 +347,25 @@ static void ns87560_lio_decode_update(NS87560LIOState *s)
 {
     uint16_t fer = pci_get_word(s->dev.config + CFG_FER);
     uint32_t acpibar = pci_get_long(s->dev.config + CFG_ACPIBAR);
+    hwaddr fdc = lio_win_base(s, CFG_FDCBAR);
     int i;
 
     memory_region_transaction_begin();
+    isa_fdc_set_iobase(s->fdc, fdc);
+    isa_fdc_set_enabled(s->fdc, fer & FER_FDC);
+    memory_region_set_address(&s->fdccfg_idx_io, fdc);
+    memory_region_set_enabled(&s->fdccfg_idx_io, fer & FER_FDC);
+    memory_region_set_address(&s->fdccfg_data_io, fdc + 1);
+    memory_region_set_enabled(&s->fdccfg_data_io,
+                              (fer & FER_FDC) && s->fdccfg_mode);
+    for (i = 0; i < 2; i++) {
+        bool en = fer & (i ? FER_DMA2 : FER_DMA1);
+
+        memory_region_set_enabled(&s->dma[i]->channel_io, en);
+        memory_region_set_enabled(&s->dma[i]->cont_io, en);
+        portio_list_set_enabled(&s->dma[i]->portio_page, en);
+    }
+    memory_region_set_enabled(&s->dma_hipage_io, fer & (FER_DMA1 | FER_DMA2));
     for (i = 0; i < 2; i++) {
         isa_serial_set_iobase(s->serial[i],
                               lio_win_base(s, i ? CFG_SP2BAR : CFG_SP1BAR));
@@ -376,6 +402,155 @@ static const uint8_t acpi_w1c[0x20] = {
     [0x00] = 0xff, [0x01] = 0xff, [0x0c] = 0xff, [0x0d] = 0xff,
     [0x10] = 0xff,
 };
+
+/*
+ * 8237 high page registers 480h-48Fh, at the same offsets as the low
+ * pages 80h-8Fh.  Unused offsets read 0.  Each half follows its 8237's
+ * enable in 5Ah.
+ */
+static const int8_t hipage_chan[16] = {
+    -1, 2, 3, 1, -1, -1, -1, 0,
+    -1, 6, 7, 5, -1, -1, -1, -1
+};
+
+static bool ns87560_hipage_decoded(NS87560LIOState *s, hwaddr addr)
+{
+    return pci_get_word(s->dev.config + CFG_FER) &
+           (addr < 8 ? FER_DMA1 : FER_DMA2);
+}
+
+static uint64_t ns87560_hipage_read(void *opaque, hwaddr addr, unsigned size)
+{
+    NS87560LIOState *s = opaque;
+    int ch = hipage_chan[addr];
+
+    if (!ns87560_hipage_decoded(s, addr)) {
+        return 0xff;
+    }
+    return ch < 0 ? 0 : s->dma[ch >> 2]->regs[ch & 3].pageh;
+}
+
+static void ns87560_hipage_write(void *opaque, hwaddr addr, uint64_t val,
+                                 unsigned size)
+{
+    NS87560LIOState *s = opaque;
+    int ch = hipage_chan[addr];
+
+    if (ns87560_hipage_decoded(s, addr) && ch >= 0) {
+        s->dma[ch >> 2]->regs[ch & 3].pageh = val;
+    }
+}
+
+static const MemoryRegionOps ns87560_hipage_ops = {
+    .read = ns87560_hipage_read,
+    .write = ns87560_hipage_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 1 },
+};
+
+/*
+ * FDC configuration mode (p.95-96): with 5Dh bit 0 set, writing 55h to
+ * FDCBAR+0 enters it, AAh leaves it.  Inside, +0 is the index and +1 the
+ * data of ten registers.  Outside, +0 is SRA, which reads FFh in PC-AT
+ * mode; +1 is the FDC core's SRB.
+ */
+static const uint8_t fdccfg_wmask[10] = {
+    [1] = 0x45, [2] = 0x01, [3] = 0x33, [7] = 0xff, [8] = 0xff, [9] = 0xff
+};
+static const uint8_t fdccfg_reset[10] = {
+    [0] = NS87560_FDC_DID, [7] = 0x05, [8] = 0x05, [9] = 0x05
+};
+
+static void ns87560_fdccfg_set_mode(NS87560LIOState *s, bool on)
+{
+    s->fdccfg_mode = on;
+    memory_region_set_enabled(&s->fdccfg_data_io,
+                              on && (pci_get_word(s->dev.config + CFG_FER) &
+                                     FER_FDC));
+    trace_ns87560_fdc_cfg_mode(on);
+}
+
+static uint64_t ns87560_fdccfg_idx_read(void *opaque, hwaddr addr,
+                                        unsigned size)
+{
+    NS87560LIOState *s = opaque;
+
+    if (s->fdccfg[1] & 0x40) {
+        qemu_log_mask(LOG_UNIMP, "ns87560: FDC PS/2 mode status A\n");
+    }
+    return 0xff;
+}
+
+static void ns87560_fdccfg_idx_write(void *opaque, hwaddr addr, uint64_t val,
+                                     unsigned size)
+{
+    NS87560LIOState *s = opaque;
+
+    if (!s->fdccfg_mode) {
+        if (val == 0x55 && (s->dev.config[CFG_SFE] & SFE_FDC_CFG)) {
+            s->fdccfg_index = 0;
+            ns87560_fdccfg_set_mode(s, true);
+        }
+    } else if (val == 0xaa) {
+        ns87560_fdccfg_set_mode(s, false);
+    } else {
+        s->fdccfg_index = val;
+    }
+}
+
+static uint64_t ns87560_fdccfg_data_read(void *opaque, hwaddr addr,
+                                         unsigned size)
+{
+    NS87560LIOState *s = opaque;
+
+    return s->fdccfg_index < ARRAY_SIZE(s->fdccfg) ?
+           s->fdccfg[s->fdccfg_index] : 0;
+}
+
+static void ns87560_fdccfg_data_write(void *opaque, hwaddr addr, uint64_t val,
+                                      unsigned size)
+{
+    NS87560LIOState *s = opaque;
+    int i = s->fdccfg_index;
+
+    if (i >= ARRAY_SIZE(s->fdccfg) || !fdccfg_wmask[i]) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ns87560: FDC config register 0x%x is read-only\n", i);
+        return;
+    }
+    s->fdccfg[i] = (s->fdccfg[i] & ~fdccfg_wmask[i]) | (val & fdccfg_wmask[i]);
+    if (i == 1 && (val & 0x40)) {
+        qemu_log_mask(LOG_UNIMP, "ns87560: FDC PS/2 mode\n");
+    }
+    trace_ns87560_fdc_cfg(i, val);
+}
+
+static const MemoryRegionOps ns87560_fdccfg_idx_ops = {
+    .read = ns87560_fdccfg_idx_read,
+    .write = ns87560_fdccfg_idx_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 1 },
+};
+
+static const MemoryRegionOps ns87560_fdccfg_data_ops = {
+    .read = ns87560_fdccfg_data_read,
+    .write = ns87560_fdccfg_data_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 1 },
+};
+
+static void ns87560_fdccfg_reset(NS87560LIOState *s)
+{
+    memcpy(s->fdccfg, fdccfg_reset, sizeof(s->fdccfg));
+    s->fdccfg_index = 0;
+    ns87560_fdccfg_set_mode(s, false);
+}
+
+/* 63h bits 6:4: 1xx routes the FDC to channel xx, 0xx leaves it unrouted */
+static int ns87560_fdc_dma_channel(uint8_t dmart1)
+{
+    return (dmart1 & 0x40) ? (dmart1 >> 4) & 3 : -1;
+}
 
 bool ns87560_lio_ide_channel_enabled(NS87560LIOState *s, int channel)
 {
@@ -446,6 +621,16 @@ static void ns87560_lio_config_write(PCIDevice *d, uint32_t addr,
     if (ranges_overlap(addr, len, CFG_FER, 2) ||
         ranges_overlap(addr, len, 0x84, 0x1c)) {
         ns87560_lio_decode_update(s);
+    }
+    if (range_covers_byte(addr, len, CFG_SFE) &&
+        !(d->config[CFG_SFE] & SFE_FDC_CFG) && s->fdccfg_mode) {
+        ns87560_fdccfg_set_mode(s, false);
+    }
+    /* isa-fdc binds its DMA channel at realize; it cannot move later. */
+    if (range_covers_byte(addr, len, CFG_DMART1) &&
+        ns87560_fdc_dma_channel(d->config[CFG_DMART1]) != s->fdc_dma) {
+        qemu_log_mask(LOG_UNIMP, "ns87560: FDC DMA routing change (63h = "
+                      "0x%02x) has no effect\n", d->config[CFG_DMART1]);
     }
     if (ranges_overlap(addr, len, CFG_ELCR, 2)) {
         ns87560_lio_update_elcr(s);
@@ -554,6 +739,48 @@ static void ns87560_lio_realize(PCIDevice *d, Error **errp)
         }
     }
 
+    /* 8237 pair; fn1 owns the high page registers (480h-48Fh). */
+    for (i = 0; i < 2; i++) {
+        ISADevice *dma = isa_new(TYPE_I8257);
+
+        object_property_add_child(OBJECT(d), "dma[*]", OBJECT(dma));
+        qdev_prop_set_int32(DEVICE(dma), "base", i ? 0xc0 : 0x00);
+        qdev_prop_set_int32(DEVICE(dma), "page-base", i ? 0x88 : 0x80);
+        qdev_prop_set_int32(DEVICE(dma), "pageh-base", -1);
+        qdev_prop_set_int32(DEVICE(dma), "dshift", i);
+        qdev_prop_set_bit(DEVICE(dma), "pageh-autoclear", true);
+        if (!isa_realize_and_unref(dma, s->isa_bus, errp)) {
+            return;
+        }
+        s->dma[i] = I8257(dma);
+    }
+    isa_bus_dma(s->isa_bus, ISADMA(s->dma[0]), ISADMA(s->dma[1]));
+    memory_region_init_io(&s->dma_hipage_io, OBJECT(d), &ns87560_hipage_ops,
+                          s, "ns87560-dma-hipage", 16);
+    memory_region_add_subregion(io, 0x480, &s->dma_hipage_io);
+
+    /* FDC: the DMA channel comes from the reset value of 63h (2). */
+    s->fdc_dma = ns87560_fdc_dma_channel(s->dev.config[CFG_DMART1]);
+    s->fdc = isa_new(TYPE_ISA_FDC);
+    object_property_add_child(OBJECT(d), "fdc", OBJECT(s->fdc));
+    qdev_prop_set_uint32(DEVICE(s->fdc), "iobase", lio_win_base(s, CFG_FDCBAR));
+    qdev_prop_set_uint32(DEVICE(s->fdc), "irq", 6);
+    qdev_prop_set_uint32(DEVICE(s->fdc), "dma", s->fdc_dma);
+    qdev_prop_set_uint8(DEVICE(s->fdc), "part-id", NS87560_FDC_PARTID);
+    qdev_prop_set_bit(DEVICE(s->fdc), "mode-cmd", true);
+    if (!isa_realize_and_unref(s->fdc, s->isa_bus, errp)) {
+        return;
+    }
+    memory_region_init_io(&s->fdccfg_idx_io, OBJECT(d), &ns87560_fdccfg_idx_ops,
+                          s, "ns87560-fdc-cfg-idx", 1);
+    memory_region_set_enabled(&s->fdccfg_idx_io, false);
+    memory_region_add_subregion(io, 0, &s->fdccfg_idx_io);
+    memory_region_init_io(&s->fdccfg_data_io, OBJECT(d),
+                          &ns87560_fdccfg_data_ops, s, "ns87560-fdc-cfg-data", 1);
+    memory_region_set_enabled(&s->fdccfg_data_io, false);
+    memory_region_add_subregion_overlap(io, 0, &s->fdccfg_data_io, 1);
+    ns87560_fdccfg_reset(s);
+
     memory_region_init_io(&s->acpi_io, OBJECT(d), &ns87560_acpi_ops, s,
                           "ns87560-acpi", sizeof(s->acpi_regs));
     memory_region_set_enabled(&s->acpi_io, false);
@@ -569,6 +796,7 @@ static void ns87560_lio_reset_hold(Object *obj, ResetType type)
 
     ns87560_lio_config_defaults(s);
     memset(s->acpi_regs, 0, sizeof(s->acpi_regs));
+    ns87560_fdccfg_reset(s);
     ns87560_lio_update_elcr(s);
     ns87560_lio_decode_update(s);
 }
@@ -618,6 +846,9 @@ static const VMStateDescription vmstate_ns87560_lio = {
         VMSTATE_PCI_DEVICE(dev, NS87560LIOState),
         VMSTATE_UINT32(src_level, NS87560LIOState),
         VMSTATE_UINT8_ARRAY(acpi_regs, NS87560LIOState, 0x20),
+        VMSTATE_UINT8_ARRAY(fdccfg, NS87560LIOState, 10),
+        VMSTATE_UINT8(fdccfg_index, NS87560LIOState),
+        VMSTATE_BOOL(fdccfg_mode, NS87560LIOState),
         VMSTATE_END_OF_LIST()
     }
 };
