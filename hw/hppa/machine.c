@@ -30,6 +30,7 @@
 #include "hw/pci-host/astro.h"
 #include "hw/pci-host/dino.h"
 #include "hw/isa/ns87560.h"
+#include "hw/ide/pci.h"
 #include "hw/misc/lasi.h"
 #include "hw/scsi/ncr53c710.h"
 #include "hw/scsi/lasi_ncr710.h"
@@ -854,6 +855,7 @@ static void machine_HP_C3700_init(MachineState *machine)
         qdev_prop_set_chr(sio, "chardev-sp2", serial_hd(1));
         qdev_prop_set_chr(sio, "chardev-pp", parallel_hds[0]);
         qdev_realize_and_unref(sio, NULL, &error_fatal);
+        pci_ide_create_devs(NS87560(sio)->ide);
     } else if (is_C3700)  {
         PCIDevice *ide_pdev = pci_create_simple(pci_bus, PCI_DEVFN(2, 0),
                                                 "pc87560-ide");

@@ -40,7 +40,9 @@
 
 #define CFG_FER                 0x5a
 #define FER_SP1                 BIT(1)
+#define FER_IDE1                BIT(2)
 #define FER_SP2                 BIT(3)
+#define FER_IDE2                BIT(4)
 #define FER_PP                  BIT(5)
 #define FER_PIC                 BIT(9)
 #define CFG_ACPIBAR             0x88
@@ -354,6 +356,9 @@ static void ns87560_lio_decode_update(NS87560LIOState *s)
     }
     memory_region_set_address(&s->acpi_io, acpibar & ~0x1fu);
     memory_region_set_enabled(&s->acpi_io, acpibar & 1);
+    if (s->ide_notify) {
+        s->ide_notify(s->ide);
+    }
     memory_region_transaction_commit();
     trace_ns87560_decode(fer, lio_win_base(s, CFG_SP1BAR),
                          lio_win_base(s, CFG_SP2BAR),
@@ -371,6 +376,19 @@ static const uint8_t acpi_w1c[0x20] = {
     [0x00] = 0xff, [0x01] = 0xff, [0x0c] = 0xff, [0x0d] = 0xff,
     [0x10] = 0xff,
 };
+
+bool ns87560_lio_ide_channel_enabled(NS87560LIOState *s, int channel)
+{
+    return pci_get_word(s->dev.config + CFG_FER) &
+           (channel ? FER_IDE2 : FER_IDE1);
+}
+
+void ns87560_lio_set_decode_notifier(NS87560LIOState *s,
+                                     NS87560DecodeNotify fn, PCIDevice *ide)
+{
+    s->ide_notify = fn;
+    s->ide = ide;
+}
 
 static uint64_t ns87560_acpi_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -674,6 +692,8 @@ static void ns87560_realize(DeviceState *dev, Error **errp)
     s->ide = pci_new_multifunction(PCI_DEVFN(s->slot, NS87560_FN_IDE),
                                    TYPE_NS87415_IDE);
     object_property_add_child(OBJECT(dev), "ide", OBJECT(s->ide));
+    object_property_set_link(OBJECT(s->ide), "lio", OBJECT(s->lio),
+                             &error_abort);
     if (!pci_realize_and_unref(s->ide, s->bus, errp)) {
         return;
     }

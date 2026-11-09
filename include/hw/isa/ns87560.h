@@ -22,6 +22,9 @@
 OBJECT_DECLARE_SIMPLE_TYPE(NS87560State, NS87560)
 OBJECT_DECLARE_SIMPLE_TYPE(NS87560LIOState, NS87560_LIO)
 
+/* Called by function 1 whenever the IDE channel enables in 5Ah may change */
+typedef void (*NS87560DecodeNotify)(PCIDevice *ide);
+
 /* PCI function numbers within the chip's slot */
 #define NS87560_FN_IDE   0
 #define NS87560_FN_LIO   1
@@ -78,6 +81,8 @@ struct NS87560LIOState {
     uint32_t src_level;         /* bit n = level of NS87560IrqSource n */
     uint16_t pic_level;         /* derived: level driven to each 8259 input */
     uint64_t unimp_logged;      /* config registers already reported */
+    NS87560DecodeNotify ide_notify;     /* set by function 0 */
+    PCIDevice *ide;
 };
 
 struct NS87560State {
@@ -92,5 +97,10 @@ struct NS87560State {
 
     qemu_irq usb_split[2];
 };
+
+/* Function 0 helpers: channel 0 = IDE channel 1 (5Ah bit 2), 1 = bit 4 */
+bool ns87560_lio_ide_channel_enabled(NS87560LIOState *s, int channel);
+void ns87560_lio_set_decode_notifier(NS87560LIOState *s,
+                                     NS87560DecodeNotify fn, PCIDevice *ide);
 
 #endif
