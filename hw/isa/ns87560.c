@@ -67,6 +67,8 @@
 #define NS87560_FDC_DID         0x10
 #define NS87560_FDC_PARTID      0x73
 #define CFG_ACPIBAR             0x88
+#define CFG_PMBAR               0x8c
+#define CFG_GPIODIR             0x7a
 #define CFG_SP1BAR              0x94
 #define CFG_SP2BAR              0x98
 #define CFG_PPBAR               0x9c
@@ -437,6 +439,9 @@ static void ns87560_lio_decode_update(NS87560LIOState *s)
     }
     memory_region_set_address(&s->acpi_io, acpibar & ~0x1fu);
     memory_region_set_enabled(&s->acpi_io, acpibar & 1);
+    /* No enable bit; the reset base FFFFFF00h lies outside the I/O space */
+    memory_region_set_address(&s->pm_io,
+                              pci_get_long(s->dev.config + CFG_PMBAR) & ~0xffu);
     if (s->ide_notify) {
         s->ide_notify(s->ide);
     }
@@ -1182,6 +1187,70 @@ static void ns87560_acpi_write(void *opaque, hwaddr addr, uint64_t val,
     trace_ns87560_acpi_write(addr, val);
 }
 
+/*
+ * Power management block (p.396-409): 256 bytes decoded at PMBAR, with
+ * registers at 00h-AFh.  Storage with the datasheet write and
+ * write-1-to-clear masks; nothing here has an effect in the model.
+ */
+#define NS87560_PM_SIZE 0xb0
+
+static const uint8_t pm_wmask[NS87560_PM_SIZE] = {
+    [0x00] = 0xff, [0x03] = 0xff, [0x04] = 0xff, [0x05] = 0xff,
+    [0x0c ... 0x0f] = 0xff, [0x18 ... 0x1b] = 0xff, [0x54 ... 0x57] = 0xff,
+};
+static const uint8_t pm_w1c[NS87560_PM_SIZE] = {
+    [0x02] = 0xff, [0x06] = 0xff, [0x14 ... 0x17] = 0xff,
+    [0x58 ... 0x5b] = 0xff,
+};
+
+static uint64_t ns87560_pm_read(void *opaque, hwaddr addr, unsigned size)
+{
+    NS87560LIOState *s = opaque;
+
+    if (addr >= NS87560_PM_SIZE) {
+        return 0;
+    }
+    if (addr == 0) {
+        /* GPIO data: pins configured as inputs read 0 */
+        return s->pm_regs[0] & s->dev.config[CFG_GPIODIR];
+    }
+    return s->pm_regs[addr];
+}
+
+static void ns87560_pm_write(void *opaque, hwaddr addr, uint64_t val,
+                             unsigned size)
+{
+    NS87560LIOState *s = opaque;
+    uint8_t *r;
+
+    if (addr >= NS87560_PM_SIZE) {
+        return;
+    }
+    r = &s->pm_regs[addr];
+    *r = (*r & ~pm_wmask[addr]) | (val & pm_wmask[addr]);
+    *r &= ~(val & pm_w1c[addr]);
+    if ((addr == 0x03 && val) || (addr == 0x04 && (val & 0x3f) != 0x3f) ||
+        (addr >= 0x0c && addr <= 0x0f && val) ||
+        (addr >= 0x54 && addr <= 0x57 && val)) {
+        qemu_log_mask(LOG_UNIMP, "ns87560: PM register 0x%02" HWADDR_PRIx
+                      " = 0x%02" PRIx64 " has no effect\n", addr, val);
+    }
+}
+
+static const MemoryRegionOps ns87560_pm_ops = {
+    .read = ns87560_pm_read,
+    .write = ns87560_pm_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 1, .max_access_size = 1 },
+};
+
+static void ns87560_pm_reset(NS87560LIOState *s)
+{
+    memset(s->pm_regs, 0, sizeof(s->pm_regs));
+    s->pm_regs[0x04] = 0x3f;        /* power-down controls: all enabled */
+}
+
 static const MemoryRegionOps ns87560_acpi_ops = {
     .read = ns87560_acpi_read,
     .write = ns87560_acpi_write,
@@ -1413,6 +1482,10 @@ static void ns87560_lio_realize(PCIDevice *d, Error **errp)
                           "ns87560-acpi", sizeof(s->acpi_regs));
     memory_region_set_enabled(&s->acpi_io, false);
     memory_region_add_subregion(io, 0, &s->acpi_io);
+    memory_region_init_io(&s->pm_io, OBJECT(d), &ns87560_pm_ops, s,
+                          "ns87560-pm", 0x100);
+    memory_region_add_subregion(io, 0xffffff00, &s->pm_io);
+    ns87560_pm_reset(s);
 
     ns87560_lio_update_elcr(s);
     ns87560_lio_decode_update(s);
@@ -1424,6 +1497,7 @@ static void ns87560_lio_reset_hold(Object *obj, ResetType type)
 
     ns87560_lio_config_defaults(s);
     memset(s->acpi_regs, 0, sizeof(s->acpi_regs));
+    ns87560_pm_reset(s);
     ns87560_fdccfg_reset(s);
     ns87560_scc_reset(&s->scc[0]);
     ns87560_scc_reset(&s->scc[1]);
@@ -1501,6 +1575,7 @@ static const VMStateDescription vmstate_ns87560_lio = {
         VMSTATE_PCI_DEVICE(dev, NS87560LIOState),
         VMSTATE_UINT32(src_level, NS87560LIOState),
         VMSTATE_UINT8_ARRAY(acpi_regs, NS87560LIOState, 0x20),
+        VMSTATE_UINT8_ARRAY(pm_regs, NS87560LIOState, NS87560_PM_SIZE),
         VMSTATE_UINT8_ARRAY(fdccfg, NS87560LIOState, 10),
         VMSTATE_UINT8(fdccfg_index, NS87560LIOState),
         VMSTATE_BOOL(fdccfg_mode, NS87560LIOState),

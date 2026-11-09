@@ -103,6 +103,8 @@ struct NS87560LIOState {
     uint8_t ecp_irq;
     MemoryRegion acpi_io;       /* 32 bytes at ACPIBAR */
     uint8_t acpi_regs[0x20];
+    MemoryRegion pm_io;         /* 256 bytes at PMBAR */
+    uint8_t pm_regs[0xb0];
     uint8_t periph_level;       /* SP1, SP2, PP, FDC request lines */
     uint32_t src_level;         /* bit n = level of NS87560IrqSource n */
     uint16_t pic_level;         /* derived: level driven to each 8259 input */

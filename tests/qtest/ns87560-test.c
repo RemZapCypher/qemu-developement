@@ -666,6 +666,26 @@ static void test_pp_ecp(void)
     qtest_quit(qts);
 }
 
+/* PM block at PMBAR (p.396-409): not decoded until programmed */
+static void test_pm_block(void)
+{
+    QTestState *qts = qtest_init("-machine C3700,superio=on -nodefaults");
+
+    g_assert_cmphex(inb(qts, 0xc04), ==, 0xff);
+    cfg_writel(qts, 1, 0x8c, 0x00000c00);
+    g_assert_cmphex(inb(qts, 0xc04), ==, 0x3f);     /* reset value */
+    outb(qts, 0xc03, 0x12);
+    g_assert_cmphex(inb(qts, 0xc03), ==, 0x12);
+    outb(qts, 0xc10, 0xff);                         /* read-only */
+    g_assert_cmphex(inb(qts, 0xc10), ==, 0);
+    g_assert_cmphex(inb(qts, 0xcb0), ==, 0);        /* decoded, reserved */
+    /* GPIO data: only pins set as outputs in 7Ah read back */
+    cfg_writel(qts, 1, 0x78, 0x000f0000);
+    outb(qts, 0xc00, 0xff);
+    g_assert_cmphex(inb(qts, 0xc00), ==, 0x0f);
+    qtest_quit(qts);
+}
+
 static void test_uart_relocate(void)
 {
     QTestState *qts = qtest_init("-machine C3700,superio=on -nodefaults");
@@ -743,6 +763,7 @@ int main(int argc, char **argv)
     qtest_add_func("/ns87560/uart-banks", test_uart_banks);
     qtest_add_func("/ns87560/uart-out2", test_uart_out2);
     qtest_add_func("/ns87560/pp-ecp", test_pp_ecp);
+    qtest_add_func("/ns87560/pm-block", test_pm_block);
     qtest_add_func("/ns87560/acpi-usbreg", test_acpi_usbreg);
     qtest_add_func("/ns87560/acpi-usbreg-defaults", test_acpi_usbreg_defaults);
     return g_test_run();
