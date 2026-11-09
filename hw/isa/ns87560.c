@@ -23,9 +23,190 @@
 #include "hw/pci/pci_ids.h"
 #include "hw/qdev-properties.h"
 #include "migration/vmstate.h"
+#include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/range.h"
+#include "trace.h"
 
 #define NS87560_LIO_REVISION    0x01
+#define NS87560_LIO_CMD_RESET   0x000f  /* I/O, memory, master, special cycles */
+#define NS87560_LIO_CMD_WMASK   0x014c  /* bits 2, 3, 6 and 8 are writable */
+#define NS87560_ACPIBAR_RESET   0x00000801  /* see ns87560_lio_regs[] */
+
+#define CFG_RSVD7E              0x7e
+#define CFG_ARB                 0x72
+#define NS87560_ARB_ROTATE      0x4688
+
+/*
+ * Function 1 configuration registers 40h-FFh: reset value, writable bits
+ * and, for registers whose side effects are not modelled, the bits whose
+ * setting is reported once with LOG_UNIMP.  Offsets not listed are
+ * reserved: they read as 0 and ignore writes.
+ * Source: PC87560UBD datasheet (1998), chapter 20, p.240-295.
+ */
+typedef struct NS87560LIOReg {
+    uint8_t off;
+    uint8_t size;
+    uint32_t reset;
+    uint32_t wmask;
+    uint32_t unimp;
+    const char *name;
+} NS87560LIOReg;
+
+static const NS87560LIOReg ns87560_lio_regs[] = {
+    { 0x40, 4, 0x00000000, 0xffffffff, 0x00000001, "FX region 0" },
+    { 0x44, 4, 0x00000000, 0xffffffff, 0x00000001, "FX region 1" },
+    { 0x48, 4, 0x00000000, 0xffffffff, 0x00000001, "FX region 2" },
+    { 0x4c, 4, 0x00000000, 0xffffff83, 0x00000003, "distributed DMA" },
+    { 0x50, 4, 0x00000000, 0xffffffc3, 0x00000001, "FIR scatter/gather DMA" },
+    { 0x58, 2, 0x0024,     0xb03f,     0x0013,     "subtractive decode/flash" },
+    { 0x5a, 2, 0xffbf,     0xffbf,     0,          "function enable" },
+    { 0x5c, 1, 0x00,       0xff,       0,          "system I/O config" },
+    { 0x5d, 1, 0x00,       0x03,       0,          "special function enable" },
+    { 0x5e, 1, 0x10,       0x00,       0,          "parallel port ID" },
+    { 0x5f, 1, 0x00,       0x07,       0,          "parallel port mode" },
+    { 0x61, 1, 0x00,       0x0f,       0,          "DMA routing 4" },
+    { 0x62, 1, 0x00,       0xff,       0xff,       "ROM chip selects" },
+    { 0x63, 1, 0x67,       0x77,       0,          "DMA routing 1" },
+    { 0x64, 1, 0x00,       0xff,       0,          "DMA routing 2" },
+    { 0x65, 1, 0x00,       0xff,       0,          "DMA routing 3" },
+    { 0x66, 1, 0x00,       0x7f,       0,          "DMA channel control" },
+    { 0x67, 1, 0x00,       0xfa,       0,          "ELCR 1" },
+    { 0x68, 1, 0x00,       0xde,       0,          "ELCR 2" },
+    { 0x69, 1, 0x34,       0xff,       0,          "IRCR1" },
+    { 0x6a, 1, 0x65,       0xff,       0,          "IRCR2" },
+    { 0x6b, 1, 0xfe,       0xff,       0,          "IRCR3" },
+    { 0x6c, 1, 0x00,       0xff,       0,          "IRCR4" },
+    { 0x6d, 1, 0x00,       0xff,       0,          "IRCR5" },
+    { 0x6e, 1, 0xc1,       0xff,       0,          "IRCR6" },
+    { 0x6f, 1, 0x00,       0xff,       0,          "IRCR7" },
+    { 0x70, 1, 0x00,       0xff,       0,          "IRCR8" },
+    { 0x71, 1, 0x00,       0x0f,       0,          "IRCR9" },
+    { 0x72, 2, 0x4c88,     0x7fff,     0,          "arbiter control" },
+    { 0x74, 2, 0x0000,     0xfffe,     0,          "FX region 2 mask" },
+    { 0x76, 2, 0x0000,     0xffff,     0,          "FX timing" },
+    { 0x78, 1, 0x00,       0x0f,       0,          "FX bus control" },
+    { 0x79, 1, 0x00,       0xff,       0x70,       "native IRQ pins (GPIO4-6)" },
+    { 0x7a, 1, 0x00,       0xff,       0,          "GPIO direction" },
+    { 0x7b, 1, 0x00,       0xff,       0x80,       "serial IRQ" },
+    { 0x7c, 2, 0x0000,     0xef7f,     0,          "serial IRQ enable" },
+    { 0x7e, 1, 0x01,       0x0f,       0,          "reserved 7Eh" },
+    { 0x7f, 1, 0x00,       0x3f,       0x3f,       "audio chip selects" },
+    { 0x80, 4, 0x00000000, 0x0f1ff01f, 0x00000001, "FX memory range" },
+    { 0x84, 4, 0x00000060, 0xfffffff8, 0,          "KBCBAR" },
+    /*
+     * ACPIBAR resets to 0 on the chip; firmware programs it.  The model
+     * starts at 800h: SeaBIOS assigns PCI I/O BARs from 1000h upwards, and
+     * Linux writes ACPIBAR + 1Fh without programming the base.
+     */
+    { 0x88, 4, NS87560_ACPIBAR_RESET, 0xffffffe1, 0, "ACPIBAR" },
+    { 0x8c, 4, 0xffffff01, 0xffffff00, 0,          "PMBAR" },
+    { 0x90, 4, 0x000003f1, 0xfffffff8, 0,          "FDCBAR" },
+    { 0x94, 4, 0x000003f9, 0xfffffff8, 0,          "SP1BAR" },
+    { 0x98, 4, 0x000002f9, 0xfffffff8, 0,          "SP2BAR" },
+    { 0x9c, 4, 0x00000379, 0xfffffff8, 0,          "PPBAR" },
+    { 0xff, 1, 0x00,       0x0f,       0,          "test register" },
+};
+
+static uint32_t lio_cfg(NS87560LIOState *s, const NS87560LIOReg *r)
+{
+    uint8_t *c = s->dev.config + r->off;
+
+    return r->size == 4 ? pci_get_long(c) : r->size == 2 ? pci_get_word(c) : *c;
+}
+
+static void lio_cfg_set(uint8_t *c, const NS87560LIOReg *r, uint32_t v)
+{
+    if (r->size == 4) {
+        pci_set_long(c + r->off, v);
+    } else if (r->size == 2) {
+        pci_set_word(c + r->off, v);
+    } else {
+        c[r->off] = v;
+    }
+}
+
+static void ns87560_lio_init_masks(NS87560LIOState *s)
+{
+    uint8_t *w = s->dev.wmask;
+    int i;
+
+    memset(w + PCI_CONFIG_HEADER_SIZE, 0,
+           PCI_CONFIG_SPACE_SIZE - PCI_CONFIG_HEADER_SIZE);
+    pci_set_word(w + PCI_COMMAND, NS87560_LIO_CMD_WMASK);
+    w[PCI_CLASS_PROG] = 0xff;
+    w[PCI_INTERRUPT_LINE] = 0;
+    for (i = 0; i < ARRAY_SIZE(ns87560_lio_regs); i++) {
+        lio_cfg_set(w, &ns87560_lio_regs[i], ns87560_lio_regs[i].wmask);
+    }
+}
+
+static void ns87560_lio_config_defaults(NS87560LIOState *s)
+{
+    uint8_t *c = s->dev.config;
+    int i;
+
+    pci_set_word(c + PCI_COMMAND, NS87560_LIO_CMD_RESET);
+    c[PCI_CLASS_PROG] = 0;
+    c[PCI_CACHE_LINE_SIZE] = 0;
+    c[PCI_LATENCY_TIMER] = 0;
+    memset(c + PCI_CONFIG_HEADER_SIZE, 0,
+           PCI_CONFIG_SPACE_SIZE - PCI_CONFIG_HEADER_SIZE);
+    for (i = 0; i < ARRAY_SIZE(ns87560_lio_regs); i++) {
+        lio_cfg_set(c, &ns87560_lio_regs[i], ns87560_lio_regs[i].reset);
+    }
+    s->unimp_logged = 0;
+}
+
+/* Report each unmodelled side-effect register once. */
+static void ns87560_lio_check_unimp(NS87560LIOState *s, uint32_t addr, int len)
+{
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(ns87560_lio_regs); i++) {
+        const NS87560LIOReg *r = &ns87560_lio_regs[i];
+        uint32_t v;
+
+        if (!ranges_overlap(addr, len, r->off, r->size)) {
+            continue;
+        }
+        v = lio_cfg(s, r);
+        if ((v & r->unimp) && !(s->unimp_logged & BIT_ULL(i))) {
+            s->unimp_logged |= BIT_ULL(i);
+            qemu_log_mask(LOG_UNIMP, "ns87560: %s (config 0x%02x = 0x%x) "
+                          "has no effect in this model\n", r->name, r->off, v);
+        }
+        if (r->off == CFG_RSVD7E && v != 0x01) {
+            qemu_log_mask(LOG_GUEST_ERROR, "ns87560: reserved config 0x7e "
+                          "written with 0x%02x (must stay 0x01)\n", v);
+        }
+    }
+}
+
+static void ns87560_lio_config_write(PCIDevice *d, uint32_t addr,
+                                     uint32_t val, int len)
+{
+    NS87560LIOState *s = NS87560_LIO(d);
+
+    trace_ns87560_lio_config_write(addr, val, len);
+    pci_default_write_config(d, addr, val, len);
+
+    if (ranges_overlap(addr, len, CFG_ARB, 2)) {
+        /* Two equal priority fields select rotate mode (p.277). */
+        uint16_t v = pci_get_word(d->config + CFG_ARB) & 0x7fff;
+        int i, j;
+
+        for (i = 0; i < 5; i++) {
+            for (j = i + 1; j < 5; j++) {
+                if (((v >> (3 * i)) & 7) == ((v >> (3 * j)) & 7)) {
+                    pci_set_word(d->config + CFG_ARB, NS87560_ARB_ROTATE);
+                    i = j = 5;
+                }
+            }
+        }
+    }
+    ns87560_lio_check_unimp(s, addr, len);
+}
 
 /* ---- Function 1: legacy I/O bridge ------------------------------------ */
 
@@ -52,6 +233,27 @@ static void ns87560_lio_instance_init(Object *obj)
 
 static void ns87560_lio_realize(PCIDevice *d, Error **errp)
 {
+    NS87560LIOState *s = NS87560_LIO(d);
+
+    ns87560_lio_init_masks(s);
+    ns87560_lio_config_defaults(s);
+}
+
+static void ns87560_lio_reset_hold(Object *obj, ResetType type)
+{
+    ns87560_lio_config_defaults(NS87560_LIO(obj));
+}
+
+/*
+ * The PCI bus reset clears the writable Command bits after the device's
+ * hold phase; restore the documented reset value afterwards.
+ */
+static void ns87560_lio_reset_exit(Object *obj, ResetType type)
+{
+    NS87560LIOState *s = NS87560_LIO(obj);
+
+    pci_set_word(s->dev.config + PCI_COMMAND, NS87560_LIO_CMD_RESET);
+    memory_region_set_enabled(&s->dev.bus_master_enable_region, true);
 }
 
 static const VMStateDescription vmstate_ns87560_lio = {
@@ -69,12 +271,16 @@ static void ns87560_lio_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     k->realize = ns87560_lio_realize;
+    k->config_write = ns87560_lio_config_write;
     k->vendor_id = PCI_VENDOR_ID_NS;
     k->device_id = PCI_DEVICE_ID_NS_87560_LIO;
     k->revision = NS87560_LIO_REVISION;
     k->class_id = PCI_CLASS_BRIDGE_OTHER;
+    rc->phases.hold = ns87560_lio_reset_hold;
+    rc->phases.exit = ns87560_lio_reset_exit;
     dc->vmsd = &vmstate_ns87560_lio;
     dc->desc = "NS87560 Legacy I/O (PCI function 1)";
     set_bit(DEVICE_CATEGORY_BRIDGE, dc->categories);
