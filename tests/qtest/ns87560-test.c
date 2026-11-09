@@ -10,6 +10,7 @@
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
 #include "libqtest.h"
+#include "qobject/qdict.h"
 
 /* Elroy 0 register window as seen by the CPU (hw/hppa/hppa_hardware.h) */
 #define ELROY0_HPA          0xfffffffffed30000ULL
@@ -686,6 +687,86 @@ static void test_pm_block(void)
     qtest_quit(qts);
 }
 
+#define MIG_ARGS    "-machine C3700,superio=on -global diva-gsp.disable=true " \
+                    "-nodefaults -parallel null " \
+                    "-drive if=ide,index=0,file=null-co://,format=raw"
+
+static void wait_migration(QTestState *qts)
+{
+    for (;;) {
+        QDict *rsp = qtest_qmp(qts, "{ 'execute': 'query-migrate' }");
+        QDict *ret = qdict_get_qdict(rsp, "return");
+        const char *st = qdict_haskey(ret, "status") ?
+                         qdict_get_str(ret, "status") : "none";
+        bool done = !strcmp(st, "completed");
+
+        g_assert(strcmp(st, "failed"));
+        qobject_unref(rsp);
+        if (done) {
+            return;
+        }
+        g_usleep(10000);
+    }
+}
+
+/*
+ * Program state in every part of the chip, migrate through a file and
+ * check it on the destination, including the decode that post_load
+ * must rebuild (QM-028).
+ */
+static void test_migration(void)
+{
+    g_autofree char *path = g_strdup_printf("%s/ns87560-mig-%d",
+                                            g_get_tmp_dir(), getpid());
+    g_autofree char *uri = g_strdup_printf("file:%s", path);
+    QTestState *src = qtest_init(MIG_ARGS);
+    QTestState *dst;
+
+    outb(src, 0x21, 0xa5);                              /* PIC IMR */
+    cfg_writel(src, 1, 0x94, 0x3e9);                    /* SP1 -> 3E8h */
+    outb(src, 0x3e8 + 7, 0x5a);                         /* scratch */
+    outb(src, 0x3e8 + 3, 0xe4);                         /* bank 3 */
+    ide_go_native(src);
+    cfg_writel(src, 1, 0x5c, 0x04000100);               /* 5Dh.0, 5Fh ECP */
+    outb(src, 0x3f0, 0x55);                             /* FDC config mode */
+    outb(src, 0x3f0, 0x07);
+    outb(src, 0x3f1, 0x12);
+    outb(src, 0x483, 0x34);                             /* DMA high page */
+    outb(src, 0x92, 0x02);
+    cfg_writel(src, 1, 0x8c, 0xc00);                    /* PMBAR */
+    outb(src, 0xc03, 0x56);
+    outb(src, 0x778 + 2, 0xc0);                         /* ECP test FIFO */
+    outb(src, 0x778, 0x78);
+    cfg_writel(src, 2, 0x14, NUSB_BAR);
+    cfg_writel(src, 2, 0x04, 0x0006);
+    mem_writel(src, NUSB_BAR, 0x00000300);
+
+    qtest_qmp_assert_success(src, "{ 'execute': 'migrate', 'arguments': "
+                             "{ 'uri': %s } }", uri);
+    wait_migration(src);
+    qtest_quit(src);
+
+    dst = qtest_initf(MIG_ARGS " -incoming file:%s", path);
+    wait_migration(dst);
+
+    g_assert_cmphex(inb(dst, 0x21), ==, 0xa5);
+    g_assert_cmphex(inb(dst, 0x3e8 + 3), ==, 0xe4);
+    g_assert_cmphex(inb(dst, 0x3e8 + 0), ==, 0x20);     /* bank 3 DID */
+    outb(dst, 0x3e8 + 3, 0x03);
+    g_assert_cmphex(inb(dst, 0x3e8 + 7), ==, 0x5a);
+    g_assert_cmphex(cfg_readb(dst, 0, 0x09), ==, 0x8f);
+    g_assert_cmphex(inb(dst, IDE_CMD_BASE + 7), ==, 0x50);
+    g_assert_cmphex(inb(dst, 0x1f7), ==, 0xff);
+    g_assert_cmphex(inb(dst, 0x3f1), ==, 0x12);
+    g_assert_cmphex(inb(dst, 0x483), ==, 0x34);
+    g_assert_cmphex(inb(dst, 0x92), ==, 0x02);
+    g_assert_cmphex(inb(dst, 0xc03), ==, 0x56);
+    g_assert_cmphex(inb(dst, 0x778), ==, 0x78);
+    g_assert_cmphex(mem_readl(dst, NUSB_BAR), ==, 0x00000300);
+    qtest_quit(dst);
+    unlink(path);
+}
+
 static void test_uart_relocate(void)
 {
     QTestState *qts = qtest_init("-machine C3700,superio=on -nodefaults");
@@ -764,6 +845,7 @@ int main(int argc, char **argv)
     qtest_add_func("/ns87560/uart-out2", test_uart_out2);
     qtest_add_func("/ns87560/pp-ecp", test_pp_ecp);
     qtest_add_func("/ns87560/pm-block", test_pm_block);
+    qtest_add_func("/ns87560/migration", test_migration);
     qtest_add_func("/ns87560/acpi-usbreg", test_acpi_usbreg);
     qtest_add_func("/ns87560/acpi-usbreg-defaults", test_acpi_usbreg_defaults);
     return g_test_run();
