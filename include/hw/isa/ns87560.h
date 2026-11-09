@@ -93,6 +93,14 @@ struct NS87560LIOState {
     ISADevice *serial[2];       /* SCC1, SCC2 (16550 core) */
     NS87560SCCState scc[2];
     ISADevice *parallel;        /* NULL when no chardev is attached */
+    MemoryRegion ecp_io;        /* PPBAR+400h, ECP modes of 5Fh */
+    MemoryRegion ecp_afifo_io;  /* PPBAR+0 in ECR mode 011 */
+    uint8_t ecr;
+    uint8_t eir;
+    uint8_t edr[4];             /* Control0/2/4, PPConfig0 */
+    uint8_t ecp_fifo[16];       /* test FIFO (ECR mode 110) */
+    uint8_t ecp_fifo_n;
+    uint8_t ecp_irq;
     MemoryRegion acpi_io;       /* 32 bytes at ACPIBAR */
     uint8_t acpi_regs[0x20];
     uint8_t periph_level;       /* SP1, SP2, PP, FDC request lines */

@@ -634,6 +634,38 @@ static void test_uart_out2(void)
     qtest_quit(qts);
 }
 
+#define ECP     (0x378 + 0x400)
+
+/* ECP registers at PPBAR+400h, enabled by 5Fh (p.328-335) */
+static void test_pp_ecp(void)
+{
+    QTestState *qts = qtest_init("-machine C3700,superio=on -nodefaults "
+                                 "-parallel null");
+
+    g_assert_cmphex(inb(qts, ECP + 2), ==, 0xff);   /* 5Fh = 0: compatible */
+    cfg_writel(qts, 1, 0x5c, 0x04000000);            /* 5Fh = 100b: ECP */
+    g_assert_cmphex(inb(qts, ECP + 2), ==, 0x15);   /* ECR reset */
+
+    outb(qts, ECP + 2, 0xe0);                        /* configuration mode */
+    g_assert_cmphex(inb(qts, ECP + 0), ==, 0x14);   /* CNFGA */
+
+    outb(qts, ECP + 2, 0xc0);                        /* test FIFO mode */
+    outb(qts, ECP + 0, 0x11);
+    outb(qts, ECP + 0, 0x22);
+    g_assert_cmphex(inb(qts, ECP + 2) & 0x03, ==, 0);
+    g_assert_cmphex(inb(qts, ECP + 0), ==, 0x11);
+    g_assert_cmphex(inb(qts, ECP + 0), ==, 0x22);
+    g_assert_cmphex(inb(qts, ECP + 2) & 0x03, ==, 0x01);    /* empty */
+
+    /* Forward FIFO mode: serviceIntr is set once software clears it */
+    outb(qts, ECP + 2, 0x40);
+    g_assert_cmphex(inb(qts, ECP + 2) & 0x04, ==, 0x04);
+
+    cfg_writel(qts, 1, 0x5c, 0);
+    g_assert_cmphex(inb(qts, ECP + 2), ==, 0xff);
+    qtest_quit(qts);
+}
+
 static void test_uart_relocate(void)
 {
     QTestState *qts = qtest_init("-machine C3700,superio=on -nodefaults");
@@ -710,6 +742,7 @@ int main(int argc, char **argv)
     qtest_add_func("/ns87560/fixed-ports", test_fixed_ports);
     qtest_add_func("/ns87560/uart-banks", test_uart_banks);
     qtest_add_func("/ns87560/uart-out2", test_uart_out2);
+    qtest_add_func("/ns87560/pp-ecp", test_pp_ecp);
     qtest_add_func("/ns87560/acpi-usbreg", test_acpi_usbreg);
     qtest_add_func("/ns87560/acpi-usbreg-defaults", test_acpi_usbreg_defaults);
     return g_test_run();

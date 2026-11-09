@@ -58,6 +58,9 @@
 #define CFG_SIOCFG              0x5c
 #define SIOCFG_UIR_BANKS        BIT(6)
 #define CFG_SFE                 0x5d
+#define CFG_PPMODE              0x5f
+#define PPMODE_ECP              0x4
+#define PPMODE_ECP_EPP          0x7
 #define SFE_FDC_CFG             BIT(0)
 #define CFG_DMART1              0x63
 #define CFG_FDCBAR              0x90
@@ -311,6 +314,9 @@ static void ns87560_periph_update(NS87560LIOState *s)
             level &= sc->ss && ((sc->ss->mcr & (SCC_MCR_OUT2 | SCC_MCR_LOOP)) ||
                                 (sc->excr1 & EXCR1_EXT_SL));
         }
+        if (n == 2) {
+            level |= s->ecp_irq;
+        }
         ns87560_router_set_irq(s, src[n], level);
     }
 }
@@ -385,6 +391,8 @@ static hwaddr lio_win_base(NS87560LIOState *s, int off)
     return pci_get_long(s->dev.config + off) & ~7u;
 }
 
+static void ns87560_ecp_update_decode(NS87560LIOState *s);
+
 static void ns87560_lio_decode_update(NS87560LIOState *s)
 {
     uint16_t fer = pci_get_word(s->dev.config + CFG_FER);
@@ -420,6 +428,7 @@ static void ns87560_lio_decode_update(NS87560LIOState *s)
     if (s->parallel) {
         isa_parallel_set_iobase(s->parallel, lio_win_base(s, CFG_PPBAR));
         isa_parallel_set_enabled(s->parallel, fer & FER_PP);
+        ns87560_ecp_update_decode(s);
     }
     for (i = 0; i < 2; i++) {
         memory_region_set_enabled(&PIC_COMMON(s->pic[i])->base_io,
@@ -731,6 +740,189 @@ static void ns87560_scc_reset(NS87560SCCState *sc)
 }
 
 /*
+ * Parallel port ECP registers (p.328-335) at PPBAR+400h, decoded when 5Fh
+ * selects an ECP mode.  isa-parallel keeps PPBAR+0..7.  Bytes written to
+ * the forward FIFOs leave at once through the port's chardev, so those
+ * FIFOs always read empty; the test FIFO (ECR mode 110) holds 16 bytes.
+ * Not modelled: reverse direction, RLE, ECP DMA.
+ */
+#define NS87560_ECP_CNFGA   0x14
+#define NS87560_ECR_RESET   0x15
+
+static uint8_t ecr_mode(NS87560LIOState *s)
+{
+    return s->ecr >> 5;
+}
+
+static void ns87560_ecp_update_decode(NS87560LIOState *s)
+{
+    int pm = s->dev.config[CFG_PPMODE] & 7;
+    hwaddr base = lio_win_base(s, CFG_PPBAR);
+    bool on = (pci_get_word(s->dev.config + CFG_FER) & FER_PP) &&
+              (pm == PPMODE_ECP || pm == PPMODE_ECP_EPP);
+
+    memory_region_set_address(&s->ecp_io, base + 0x400);
+    memory_region_set_enabled(&s->ecp_io, on);
+    memory_region_set_address(&s->ecp_afifo_io, base);
+    memory_region_set_enabled(&s->ecp_afifo_io, on && ecr_mode(s) == 3);
+}
+
+/* ECR bits 1:0 report the FIFO empty / full */
+static void ns87560_ecp_fifo_status(NS87560LIOState *s)
+{
+    s->ecr = (s->ecr & ~0x03) | (s->ecp_fifo_n == 0 ? 0x01 : 0) |
+             (s->ecp_fifo_n == 16 ? 0x02 : 0);
+}
+
+/*
+ * serviceIntr (ECR bit 2): with the forward FIFO always empty, event 2
+ * (at least 8 free bytes, no DMA) is true in modes 010/011 whenever
+ * software has cleared the bit.  The interrupt is a pulse.
+ */
+static void ns87560_ecp_update_irq(NS87560LIOState *s)
+{
+    if ((ecr_mode(s) == 2 || ecr_mode(s) == 3) && !(s->ecr & 0x0c)) {
+        s->ecr |= 0x04;
+        s->ecp_irq = 1;
+        ns87560_periph_update(s);
+        s->ecp_irq = 0;
+        ns87560_periph_update(s);
+    }
+}
+
+static void ns87560_ecp_send(NS87560LIOState *s, uint8_t b)
+{
+    qemu_chr_fe_write_all(&ISA_PARALLEL(s->parallel)->state.chr, &b, 1);
+    ns87560_ecp_update_irq(s);
+}
+
+static int ecp_edr_slot(uint8_t eir)
+{
+    switch (eir) {
+    case 0:
+        return 0;
+    case 2:
+        return 1;
+    case 4:
+        return 2;
+    case 5:
+        return 3;
+    }
+    return -1;
+}
+
+static uint64_t ns87560_ecp_read(void *opaque, hwaddr off, unsigned size)
+{
+    NS87560LIOState *s = opaque;
+    int slot;
+    uint8_t v;
+
+    switch (off) {
+    case 0:
+        if (ecr_mode(s) == 7) {
+            return NS87560_ECP_CNFGA;
+        }
+        if (ecr_mode(s) == 6 && s->ecp_fifo_n) {
+            v = s->ecp_fifo[0];
+            memmove(s->ecp_fifo, s->ecp_fifo + 1, --s->ecp_fifo_n);
+            ns87560_ecp_fifo_status(s);
+            return v;
+        }
+        return 0xff;
+    case 1:
+        if (ecr_mode(s) != 7) {
+            return 0xff;
+        }
+        return (ISA_PARALLEL(s->parallel)->state.irq_pending ? 0x40 : 0) |
+               (s->edr[3] & 0x3b);              /* CNFGB */
+    case 2:
+        return s->ecr;
+    case 3:
+        return s->eir;
+    case 4:
+        slot = ecp_edr_slot(s->eir);
+        return slot < 0 ? 0 : s->edr[slot];
+    }
+    return 0xff;
+}
+
+static void ns87560_ecp_write(void *opaque, hwaddr off, uint64_t val,
+                              unsigned size)
+{
+    NS87560LIOState *s = opaque;
+    uint8_t old_mode;
+    int slot;
+
+    switch (off) {
+    case 0:
+        if (ecr_mode(s) == 2 || ecr_mode(s) == 3) {
+            ns87560_ecp_send(s, val);
+        } else if (ecr_mode(s) == 6 && s->ecp_fifo_n < 16) {
+            s->ecp_fifo[s->ecp_fifo_n++] = val;
+            ns87560_ecp_fifo_status(s);
+        }
+        break;
+    case 2:
+        old_mode = ecr_mode(s);
+        s->ecr = (s->ecr & 0x03) | (val & 0xfc);
+        if (old_mode != ecr_mode(s)) {
+            s->ecp_fifo_n = 0;
+        }
+        if (val & 0x08) {
+            qemu_log_mask(LOG_UNIMP, "ns87560: ECP DMA\n");
+        }
+        ns87560_ecp_fifo_status(s);
+        ns87560_ecp_update_decode(s);
+        ns87560_ecp_update_irq(s);
+        break;
+    case 3:
+        s->eir = val;
+        break;
+    case 4:
+        slot = ecp_edr_slot(s->eir);
+        if (slot >= 0) {
+            s->edr[slot] = val;
+        }
+        break;
+    }
+}
+
+static const MemoryRegionOps ns87560_ecp_ops = {
+    .read = ns87560_ecp_read,
+    .write = ns87560_ecp_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 1 },
+};
+
+/* ECP address FIFO (mode 011): write-only */
+static uint64_t ns87560_ecp_afifo_read(void *opaque, hwaddr off, unsigned size)
+{
+    return 0xff;
+}
+
+static void ns87560_ecp_afifo_write(void *opaque, hwaddr off, uint64_t val,
+                                    unsigned size)
+{
+    ns87560_ecp_send(opaque, val);
+}
+
+static const MemoryRegionOps ns87560_ecp_afifo_ops = {
+    .read = ns87560_ecp_afifo_read,
+    .write = ns87560_ecp_afifo_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 1 },
+};
+
+static void ns87560_ecp_reset(NS87560LIOState *s)
+{
+    s->ecr = NS87560_ECR_RESET;
+    s->eir = 0;
+    memset(s->edr, 0, sizeof(s->edr));
+    s->ecp_fifo_n = 0;
+    s->ecp_irq = 0;
+}
+
+/*
  * Port 61h (p.392): bit 0 gates PIT counter 2, bit 1 is speaker data,
  * bits 2/3 disable the NMI sources; bit 4 toggles on each read
  * (refresh), bit 5 is counter 2's output.  No NMI sources: bits 6/7 read 0.
@@ -1021,6 +1213,7 @@ static void ns87560_lio_config_write(PCIDevice *d, uint32_t addr,
         }
     }
     if (ranges_overlap(addr, len, CFG_FER, 2) ||
+        range_covers_byte(addr, len, CFG_PPMODE) ||
         ranges_overlap(addr, len, 0x84, 0x1c)) {
         ns87560_lio_decode_update(s);
     }
@@ -1151,6 +1344,15 @@ static void ns87560_lio_realize(PCIDevice *d, Error **errp)
         if (!qdev_realize(DEVICE(s->parallel), BUS(s->isa_bus), errp)) {
             return;
         }
+        memory_region_init_io(&s->ecp_io, OBJECT(d), &ns87560_ecp_ops, s,
+                              "ns87560-ecp", 8);
+        memory_region_set_enabled(&s->ecp_io, false);
+        memory_region_add_subregion_overlap(io, 0, &s->ecp_io, 1);
+        memory_region_init_io(&s->ecp_afifo_io, OBJECT(d),
+                              &ns87560_ecp_afifo_ops, s, "ns87560-ecp-afifo", 1);
+        memory_region_set_enabled(&s->ecp_afifo_io, false);
+        memory_region_add_subregion_overlap(io, 0, &s->ecp_afifo_io, 1);
+        ns87560_ecp_reset(s);
     }
 
     /* 8254; its output 0 goes straight to 8259 input 0 (not routable). */
@@ -1225,6 +1427,9 @@ static void ns87560_lio_reset_hold(Object *obj, ResetType type)
     ns87560_fdccfg_reset(s);
     ns87560_scc_reset(&s->scc[0]);
     ns87560_scc_reset(&s->scc[1]);
+    if (s->parallel) {
+        ns87560_ecp_reset(s);
+    }
     ns87560_periph_update(s);
     s->port61 = 0;
     s->port92 = 0;
@@ -1303,6 +1508,11 @@ static const VMStateDescription vmstate_ns87560_lio = {
         VMSTATE_UINT8(port92, NS87560LIOState),
         VMSTATE_UINT8_ARRAY(apm, NS87560LIOState, 2),
         VMSTATE_UINT8(periph_level, NS87560LIOState),
+        VMSTATE_UINT8(ecr, NS87560LIOState),
+        VMSTATE_UINT8(eir, NS87560LIOState),
+        VMSTATE_UINT8_ARRAY(edr, NS87560LIOState, 4),
+        VMSTATE_UINT8_ARRAY(ecp_fifo, NS87560LIOState, 16),
+        VMSTATE_UINT8(ecp_fifo_n, NS87560LIOState),
         VMSTATE_STRUCT_ARRAY(scc, NS87560LIOState, 2, 1, vmstate_ns87560_scc,
                              NS87560SCCState),
         VMSTATE_END_OF_LIST()
