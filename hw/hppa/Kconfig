@@ -1,8 +1,3 @@
-config NS87560_SUPERIO
-    select ISA_SUPERIO
-    select FDC_ISA
-    bool
-
 config HPPA_B160L
     bool
     default y
@@ -20,11 +15,9 @@ config HPPA_B160L
     select ISA_BUS
     select I8259
     select IDE_CMD646
-    select IDE_VIA
     select MC146818RTC
     select LSI_SCSI_PCI
     select LASI_82596
     select LASIPS2
     select PARALLEL
     select ARTIST
-    select NS87560_SUPERIO
