@@ -70,6 +70,11 @@ struct NS87560LIOState {
     qemu_irq cascade_out;       /* 8259 master INT (CPUINT) */
     qemu_irq bus_irqs[ISA_NUM_IRQS];
     MemoryRegion pic_cmd_io[2]; /* ICW1.LTIM filter at 20h / A0h */
+    ISADevice *serial[2];       /* SCC1, SCC2 (16550 core) */
+    ISADevice *parallel;        /* NULL when no chardev is attached */
+    MemoryRegion acpi_io;       /* 32 bytes at ACPIBAR */
+    uint8_t acpi_regs[0x20];
+    uint8_t periph_level;       /* SP1, SP2, PP, FDC request lines */
     uint32_t src_level;         /* bit n = level of NS87560IrqSource n */
     uint16_t pic_level;         /* derived: level driven to each 8259 input */
     uint64_t unimp_logged;      /* config registers already reported */

@@ -344,7 +344,8 @@ static TranslateFn *machine_HP_common_init_cpus(MachineState *machine)
  * Last creation step: Add SCSI discs, NICs, graphics & load firmware
  */
 static void machine_HP_common_init_tail(MachineState *machine, PCIBus *pci_bus,
-                                        TranslateFn *translate)
+                                        TranslateFn *translate,
+                                        bool has_superio)
 {
     const char *kernel_filename = machine->kernel_filename;
     const char *kernel_cmdline = machine->kernel_cmdline;
@@ -394,11 +395,14 @@ static void machine_HP_common_init_tail(MachineState *machine, PCIBus *pci_bus,
     if (!object_property_get_bool(OBJECT(dev), "disable", NULL)) {
         pci_dev = pci_new_multifunction(PCI_DEVFN(2, 0), "diva-gsp");
         if (!lasi_dev) {
+            /* the SuperIO UARTs, if present, own serial_hd(0) and (1) */
+            int first = has_superio ? 2 : 0;
+
             /* bind default keyboard/serial to Diva card */
-            qdev_prop_set_chr(DEVICE(pci_dev), "chardev1", serial_hd(0));
-            qdev_prop_set_chr(DEVICE(pci_dev), "chardev2", serial_hd(1));
-            qdev_prop_set_chr(DEVICE(pci_dev), "chardev3", serial_hd(2));
-            qdev_prop_set_chr(DEVICE(pci_dev), "chardev4", serial_hd(3));
+            qdev_prop_set_chr(DEVICE(pci_dev), "chardev1", serial_hd(first));
+            qdev_prop_set_chr(DEVICE(pci_dev), "chardev2", serial_hd(first + 1));
+            qdev_prop_set_chr(DEVICE(pci_dev), "chardev3", serial_hd(first + 2));
+            qdev_prop_set_chr(DEVICE(pci_dev), "chardev4", serial_hd(first + 3));
         }
         pci_realize_and_unref(pci_dev, pci_bus, &error_fatal);
     }
@@ -594,7 +598,7 @@ static void machine_HP_B160L_init(MachineState *machine)
                                                        1));
 
     /* Add SCSI discs, NICs, graphics & load firmware */
-    machine_HP_common_init_tail(machine, pci_bus, translate);
+    machine_HP_common_init_tail(machine, pci_bus, translate, false);
 }
 
 static AstroState *astro_init(void)
@@ -643,11 +647,14 @@ static void machine_HP_C3700_init(MachineState *machine)
         object_property_add_child(qdev_get_machine(), "ns87560", OBJECT(sio));
         object_property_set_link(OBJECT(sio), "bus", OBJECT(pci_bus),
                                  &error_abort);
+        qdev_prop_set_chr(sio, "chardev-sp1", serial_hd(0));
+        qdev_prop_set_chr(sio, "chardev-sp2", serial_hd(1));
+        qdev_prop_set_chr(sio, "chardev-pp", parallel_hds[0]);
         qdev_realize_and_unref(sio, NULL, &error_fatal);
     }
 
     /* Add SCSI discs, NICs, graphics & load firmware */
-    machine_HP_common_init_tail(machine, pci_bus, translate);
+    machine_HP_common_init_tail(machine, pci_bus, translate, c3700_superio);
 }
 
 static bool c3700_get_superio(Object *obj, Error **errp)
