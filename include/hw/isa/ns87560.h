@@ -9,6 +9,7 @@
 #ifndef HW_ISA_NS87560_H
 #define HW_ISA_NS87560_H
 
+#include "hw/char/serial.h"
 #include "hw/dma/i8257.h"
 #include "hw/irq.h"
 #include "hw/isa/isa.h"
@@ -64,6 +65,21 @@ typedef enum NS87560IrqSource {
     NS87560_SRC_COUNT
 } NS87560IrqSource;
 
+/* SCC1/SCC2: National Semiconductor banked UART around a 16550 core */
+typedef struct NS87560SCCState {
+    MemoryRegion io;            /* 8 bytes at SPnBAR */
+    SerialState *ss;
+    NS87560LIOState *lio;
+    int index;
+    uint8_t bsr;
+    uint8_t bank;
+    uint8_t excr1;
+    uint8_t excr2;
+    uint8_t ier_ext;            /* IER bits 7:4, extended mode only */
+    uint8_t scratch[2];         /* bank 1 offsets 0/1 while the divisor is locked */
+    uint8_t ir[10];             /* SCC2 infrared registers, banks 4-7 */
+} NS87560SCCState;
+
 struct NS87560LIOState {
     PCIDevice dev;
 
@@ -75,6 +91,7 @@ struct NS87560LIOState {
     qemu_irq bus_irqs[ISA_NUM_IRQS];
     MemoryRegion pic_cmd_io[2]; /* ICW1.LTIM filter at 20h / A0h */
     ISADevice *serial[2];       /* SCC1, SCC2 (16550 core) */
+    NS87560SCCState scc[2];
     ISADevice *parallel;        /* NULL when no chardev is attached */
     MemoryRegion acpi_io;       /* 32 bytes at ACPIBAR */
     uint8_t acpi_regs[0x20];

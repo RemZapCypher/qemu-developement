@@ -38,3 +38,4 @@ ns87560_acpi_read(uint32_t off, uint32_t val) "off 0x%x val 0x%x"
 ns87560_acpi_write(uint32_t off, uint32_t val) "off 0x%x val 0x%x"
 ns87560_fdc_cfg_mode(bool on) "FDC configuration mode %d"
 ns87560_fdc_cfg(int index, uint64_t val) "FDC config register %d <- 0x%02"PRIx64
+ns87560_scc_bank(int scc, int bank) "SCC%d bank %d"

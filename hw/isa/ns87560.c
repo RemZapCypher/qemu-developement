@@ -55,6 +55,8 @@
 #define FER_APM                 BIT(15)
 #define FER_DMA1                BIT(11)
 #define FER_DMA2                BIT(12)
+#define CFG_SIOCFG              0x5c
+#define SIOCFG_UIR_BANKS        BIT(6)
 #define CFG_SFE                 0x5d
 #define SFE_FDC_CFG             BIT(0)
 #define CFG_DMART1              0x63
@@ -278,13 +280,47 @@ static void ns87560_router_set_irq(void *opaque, int src, int level)
  * Request lines of the ISA peripherals, installed in the ISA bus input
  * table at their labels; IRCR1/IRCR2 decide where they really go.
  */
-static void ns87560_periph_irq(void *opaque, int n, int level)
+#define SCC_MCR_OUT2    0x08
+#define SCC_MCR_LOOP    0x10
+#define EXCR1_EXT_SL    BIT(0)
+#define EXCR1_LOOP      BIT(4)
+#define EXCR1_ETDLBK    BIT(5)
+#define EXCR1_BTEST     BIT(7)
+#define EXCR2_PRESL(x)  (((x) >> 4) & 3)
+#define EXCR2_LOCK      BIT(7)
+
+/*
+ * In non-extended mode MCR.OUT2 is the UART's interrupt enable; it is
+ * forced on in loopback and in extended mode (p.338).  QEMU's 16550 core
+ * does not gate its line, so the gate is applied here.
+ */
+static void ns87560_periph_update(NS87560LIOState *s)
 {
     static const int src[] = {
         NS87560_SRC_SP1, NS87560_SRC_SP2, NS87560_SRC_PP, NS87560_SRC_FDC,
     };
+    int n;
 
-    ns87560_router_set_irq(opaque, src[n], level);
+    for (n = 0; n < ARRAY_SIZE(src); n++) {
+        bool level = s->periph_level & BIT(n);
+
+        if (n < 2) {
+            NS87560SCCState *sc = &s->scc[n];
+
+            /* sc->ss is unset while the serial core realizes */
+            level &= sc->ss && ((sc->ss->mcr & (SCC_MCR_OUT2 | SCC_MCR_LOOP)) ||
+                                (sc->excr1 & EXCR1_EXT_SL));
+        }
+        ns87560_router_set_irq(s, src[n], level);
+    }
+}
+
+static void ns87560_periph_irq(void *opaque, int n, int level)
+{
+    NS87560LIOState *s = opaque;
+
+    s->periph_level = deposit32(s->periph_level, n, 1, !!level);
+    ns87560_periph_update(s);
 }
 
 /* Trigger mode comes from config 67h/68h; the chip has no I/O 4D0h/4D1h. */
@@ -377,9 +413,9 @@ static void ns87560_lio_decode_update(NS87560LIOState *s)
     memory_region_set_enabled(&s->port92_io, fer & FER_P92);
     memory_region_set_enabled(&s->apm_io, fer & FER_APM);
     for (i = 0; i < 2; i++) {
-        isa_serial_set_iobase(s->serial[i],
-                              lio_win_base(s, i ? CFG_SP2BAR : CFG_SP1BAR));
-        isa_serial_set_enabled(s->serial[i], fer & (i ? FER_SP2 : FER_SP1));
+        memory_region_set_address(&s->scc[i].io,
+                                  lio_win_base(s, i ? CFG_SP2BAR : CFG_SP1BAR));
+        memory_region_set_enabled(&s->scc[i].io, fer & (i ? FER_SP2 : FER_SP1));
     }
     if (s->parallel) {
         isa_parallel_set_iobase(s->parallel, lio_win_base(s, CFG_PPBAR));
@@ -412,6 +448,287 @@ static const uint8_t acpi_w1c[0x20] = {
     [0x00] = 0xff, [0x01] = 0xff, [0x0c] = 0xff, [0x0d] = 0xff,
     [0x10] = 0xff,
 };
+
+/*
+ * SCC register banks (p.338-350).  The Bank Select Register at offset 3
+ * is the LCR for banks 0/1; values 11xxxxx0b select banks 2-7.  Banks
+ * 0/1 are the 16550, served by QEMU's serial core.  Bank 2 holds the
+ * extended controls, bank 3 the module ID and shadows, banks 4-7 the
+ * SCC2 infrared unit (storage only).
+ */
+#define NS87560_SCC_DID 0x20
+
+static uint64_t scc_core_read(NS87560SCCState *sc, int off)
+{
+    return serial_io_ops.read(sc->ss, off, 1);
+}
+
+static void scc_core_write(NS87560SCCState *sc, int off, uint8_t val)
+{
+    serial_io_ops.write(sc->ss, off, val, 1);
+}
+
+static bool scc_locked(NS87560SCCState *sc)
+{
+    return (sc->excr2 & EXCR2_LOCK) && !(sc->excr1 & EXCR1_EXT_SL);
+}
+
+/* BSR value to bank (p.342-344); -1 for the reserved codes */
+static int scc_bank_of(uint8_t v)
+{
+    if (!(v & 0x80)) {
+        return 0;
+    }
+    if ((v & 0xc0) == 0x80 || (v & 0x03)) {
+        return 1;
+    }
+    if (v >= 0xe0 && v <= 0xf4) {
+        return 2 + (v - 0xe0) / 4;
+    }
+    return -1;
+}
+
+/* 24 MHz / prescaler / 16; prescaler 13 is QEMU's 115200 (115384 on chip) */
+static void scc_set_baudbase(NS87560SCCState *sc)
+{
+    static const uint32_t baud[4] = { 115200, 923077, 0, 1500000 };
+    uint32_t b = baud[EXCR2_PRESL(sc->excr2)];
+
+    if (!b) {
+        qemu_log_mask(LOG_GUEST_ERROR, "ns87560: SCC%d reserved prescaler\n",
+                      sc->index + 1);
+        return;
+    }
+    sc->ss->baudbase = b;
+}
+
+/* A bank 1 divisor access in extended mode falls back to 16550 mode. */
+static void scc_fallback(NS87560SCCState *sc)
+{
+    bool was_ext = sc->excr1 & EXCR1_EXT_SL;
+
+    sc->excr2 &= ~0x30;
+    scc_set_baudbase(sc);
+    sc->excr1 &= ~(EXCR1_ETDLBK | EXCR1_BTEST | (was_ext ? EXCR1_EXT_SL : 0));
+    if (sc->index == 1 && was_ext) {
+        sc->ir[0] &= ~0x0c;                     /* IR_SL back to UART */
+    }
+    sc->ier_ext = 0;
+    ns87560_periph_update(sc->lio);
+}
+
+/* (bank, offset) of the infrared registers, -1 when reserved */
+static int scc_ir_index(int bank, int off)
+{
+    static const int8_t map[4][8] = {
+        [0] = { -1, -1, 0, -1, -1, -1, -1, -1 },
+        [1] = { -1, -1, -1, -1, 1, -1, -1, -1 },
+        [2] = { 2, -1, 3, -1, -1, -1, -1, -1 },
+        [3] = { 4, 5, 6, -1, 7, -1, 8, 9 },
+    };
+    return map[bank - 4][off];
+}
+
+static uint64_t ns87560_scc_read(void *opaque, hwaddr off, unsigned size)
+{
+    NS87560SCCState *sc = opaque;
+    uint8_t lsr = sc->ss->lsr;
+    int idx;
+
+    if (off == 3) {
+        return sc->bsr;
+    }
+    switch (sc->bank) {
+    case 0:
+        if (off == 2 && (sc->excr1 & EXCR1_EXT_SL)) {
+            /* Extended mode EIR: event bits, not a priority code */
+            return (lsr & 0x01 ? 1 : 0) | (lsr & 0x20 ? 2 : 0) |
+                   (lsr & 0x1e ? 4 : 0) | (sc->ss->msr & 0x0f ? 8 : 0) |
+                   (lsr & 0x40 ? 0x20 : 0);
+        }
+        if (off == 1) {
+            return scc_core_read(sc, 1) | sc->ier_ext;
+        }
+        return scc_core_read(sc, off);
+    case 1:
+        if (off <= 1) {
+            if (scc_locked(sc)) {
+                return sc->scratch[off];
+            }
+            scc_fallback(sc);
+        }
+        return scc_core_read(sc, off);
+    case 2:
+        switch (off) {
+        case 0:
+            return sc->ss->divider & 0xff;
+        case 1:
+            return sc->ss->divider >> 8;
+        case 2:
+            return sc->excr1;
+        case 4:
+            return sc->excr2;
+        case 6:
+            return fifo8_num_used(&sc->ss->xmit_fifo) & 0x1f;
+        case 7:
+            return fifo8_num_used(&sc->ss->recv_fifo) & 0x1f;
+        }
+        return 0;
+    case 3:
+        switch (off) {
+        case 0:
+            return NS87560_SCC_DID;
+        case 1:
+            return sc->ss->lcr;
+        case 2:
+            return sc->ss->fcr;
+        }
+        return 0;
+    default:
+        if (sc->index == 0) {
+            return 0;
+        }
+        idx = scc_ir_index(sc->bank, off);
+        return idx < 0 ? 0 : idx == 7 ? sc->ir[7] & 0x70 : sc->ir[idx];
+    }
+}
+
+static void ns87560_scc_write_bsr(NS87560SCCState *sc, uint8_t val)
+{
+    NS87560LIOState *s = sc->lio;
+    int b;
+
+    sc->bsr = val;
+    if (sc->index == 1 && !(s->dev.config[CFG_SIOCFG] & SIOCFG_UIR_BANKS)) {
+        b = val >> 7;                           /* plain 16550 LCR */
+    } else {
+        b = scc_bank_of(val);
+        if (b < 0) {
+            qemu_log_mask(LOG_GUEST_ERROR, "ns87560: SCC%d reserved bank "
+                          "code 0x%02x\n", sc->index + 1, val);
+            b = 1;
+        }
+    }
+    sc->bank = b;
+    if (b <= 1) {
+        scc_core_write(sc, 3, val);
+    }
+    trace_ns87560_scc_bank(sc->index, b);
+}
+
+static void ns87560_scc_write(void *opaque, hwaddr off, uint64_t val,
+                              unsigned size)
+{
+    NS87560SCCState *sc = opaque;
+    uint8_t old, lcr;
+    int idx;
+
+    if (off == 3) {
+        ns87560_scc_write_bsr(sc, val);
+        return;
+    }
+    switch (sc->bank) {
+    case 0:
+        if (off == 1) {
+            sc->ier_ext = (sc->excr1 & EXCR1_EXT_SL) ? (val & 0xf0) : 0;
+            if (sc->ier_ext) {
+                qemu_log_mask(LOG_UNIMP, "ns87560: SCC extended-mode "
+                              "interrupt sources 0x%02x\n", sc->ier_ext);
+            }
+            val &= 0x0f;
+        }
+        scc_core_write(sc, off, val);
+        if (off == 4) {
+            ns87560_periph_update(sc->lio);
+        }
+        break;
+    case 1:
+        if (off <= 1) {
+            if (scc_locked(sc)) {
+                sc->scratch[off] = val;
+                return;
+            }
+            scc_fallback(sc);
+        }
+        scc_core_write(sc, off, val);
+        break;
+    case 2:
+        switch (off) {
+        case 0:
+        case 1:
+            /* Baud generator divisor: set it without a fallback */
+            lcr = sc->ss->lcr;
+            scc_core_write(sc, 3, lcr | 0x80);
+            scc_core_write(sc, off, val);
+            scc_core_write(sc, 3, lcr);
+            break;
+        case 2:
+            old = sc->excr1;
+            sc->excr1 = val & ~BIT(6);
+            if ((val ^ old) & EXCR1_LOOP) {
+                scc_core_write(sc, 4, (val & EXCR1_LOOP) ?
+                               sc->ss->mcr | SCC_MCR_LOOP :
+                               sc->ss->mcr & ~SCC_MCR_LOOP);
+            }
+            if (((val ^ old) & EXCR1_EXT_SL) && (sc->ss->fcr & 0x01)) {
+                scc_core_write(sc, 2, sc->ss->fcr | 0x06);  /* flush FIFOs */
+            }
+            if (val & 0x0e) {
+                qemu_log_mask(LOG_UNIMP, "ns87560: SCC DMA controls 0x%02"
+                              PRIx64 "\n", val);
+            }
+            ns87560_periph_update(sc->lio);
+            break;
+        case 4:
+            sc->excr2 = val & 0xb0;
+            scc_set_baudbase(sc);
+            break;
+        default:
+            qemu_log_mask(LOG_GUEST_ERROR, "ns87560: SCC%d bank 2 offset %d "
+                          "is read-only\n", sc->index + 1, (int)off);
+        }
+        break;
+    case 3:
+        qemu_log_mask(LOG_GUEST_ERROR, "ns87560: SCC%d bank 3 is read-only\n",
+                      sc->index + 1);
+        break;
+    default:
+        idx = sc->index ? scc_ir_index(sc->bank, off) : -1;
+        if (idx < 0) {
+            qemu_log_mask(LOG_GUEST_ERROR, "ns87560: SCC%d bank %d offset %d "
+                          "is reserved\n", sc->index + 1, sc->bank, (int)off);
+            return;
+        }
+        sc->ir[idx] = val;
+        if (idx == 0 && (val & 0x0c)) {
+            qemu_log_mask(LOG_UNIMP, "ns87560: SCC2 infrared mode\n");
+        }
+    }
+}
+
+static const MemoryRegionOps ns87560_scc_ops = {
+    .read = ns87560_scc_read,
+    .write = ns87560_scc_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 1 },
+};
+
+static void ns87560_scc_reset(NS87560SCCState *sc)
+{
+    sc->bsr = 0;
+    sc->bank = 0;
+    sc->excr1 = 0;
+    sc->excr2 = 0;
+    sc->ier_ext = 0;
+    memset(sc->scratch, 0, sizeof(sc->scratch));
+    memset(sc->ir, 0, sizeof(sc->ir));
+    sc->ir[1] = 0x02;
+    sc->ir[4] = 0x29;
+    sc->ir[5] = 0x69;
+    scc_set_baudbase(sc);
+    /* The chip's MCR resets to 0; QEMU's core reset sets OUT2. */
+    scc_core_write(sc, 4, 0);
+}
 
 /*
  * Port 61h (p.392): bit 0 gates PIT counter 2, bit 1 is speaker data,
@@ -810,6 +1127,18 @@ static void ns87560_lio_realize(PCIDevice *d, Error **errp)
         if (!qdev_realize(DEVICE(s->serial[i]), BUS(s->isa_bus), errp)) {
             return;
         }
+        /* The bank wrapper decodes SPnBAR and forwards to the 16550 core */
+        isa_serial_set_enabled(s->serial[i], false);
+        s->scc[i].ss = SERIAL(object_resolve_path_component(
+                                  OBJECT(s->serial[i]), "serial"));
+        s->scc[i].lio = s;
+        s->scc[i].index = i;
+        memory_region_init_io(&s->scc[i].io, OBJECT(d), &ns87560_scc_ops,
+                              &s->scc[i], i ? "ns87560-scc2" : "ns87560-scc1",
+                              8);
+        memory_region_set_enabled(&s->scc[i].io, false);
+        memory_region_add_subregion(io, 0, &s->scc[i].io);
+        ns87560_scc_reset(&s->scc[i]);
     }
     /* isa-parallel needs a backend; without one the port is absent. */
     if (!qemu_chr_fe_backend_connected(&ISA_PARALLEL(s->parallel)->state.chr)) {
@@ -894,6 +1223,9 @@ static void ns87560_lio_reset_hold(Object *obj, ResetType type)
     ns87560_lio_config_defaults(s);
     memset(s->acpi_regs, 0, sizeof(s->acpi_regs));
     ns87560_fdccfg_reset(s);
+    ns87560_scc_reset(&s->scc[0]);
+    ns87560_scc_reset(&s->scc[1]);
+    ns87560_periph_update(s);
     s->port61 = 0;
     s->port92 = 0;
     memset(s->apm, 0, sizeof(s->apm));
@@ -921,6 +1253,8 @@ static int ns87560_lio_post_load(void *opaque, int version_id)
                                   PIC_COMMON(s->pic[0])->elcr_mask;
     PIC_COMMON(s->pic[1])->elcr = s->dev.config[CFG_ELCR + 1] &
                                   PIC_COMMON(s->pic[1])->elcr_mask;
+    scc_set_baudbase(&s->scc[0]);
+    scc_set_baudbase(&s->scc[1]);
     ns87560_lio_decode_update(s);
     return 0;
 }
@@ -937,6 +1271,22 @@ static void ns87560_lio_reset_exit(Object *obj, ResetType type)
     memory_region_set_enabled(&s->dev.bus_master_enable_region, true);
 }
 
+static const VMStateDescription vmstate_ns87560_scc = {
+    .name = "ns87560-scc",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8(bsr, NS87560SCCState),
+        VMSTATE_UINT8(bank, NS87560SCCState),
+        VMSTATE_UINT8(excr1, NS87560SCCState),
+        VMSTATE_UINT8(excr2, NS87560SCCState),
+        VMSTATE_UINT8(ier_ext, NS87560SCCState),
+        VMSTATE_UINT8_ARRAY(scratch, NS87560SCCState, 2),
+        VMSTATE_UINT8_ARRAY(ir, NS87560SCCState, 10),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_ns87560_lio = {
     .name = "ns87560-lio",
     .version_id = 1,
@@ -952,6 +1302,9 @@ static const VMStateDescription vmstate_ns87560_lio = {
         VMSTATE_UINT8(port61, NS87560LIOState),
         VMSTATE_UINT8(port92, NS87560LIOState),
         VMSTATE_UINT8_ARRAY(apm, NS87560LIOState, 2),
+        VMSTATE_UINT8(periph_level, NS87560LIOState),
+        VMSTATE_STRUCT_ARRAY(scc, NS87560LIOState, 2, 1, vmstate_ns87560_scc,
+                             NS87560SCCState),
         VMSTATE_END_OF_LIST()
     }
 };
