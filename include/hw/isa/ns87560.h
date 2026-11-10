@@ -101,7 +101,6 @@ struct NS87560LIOState {
     uint8_t edr[4];             /* Control0/2/4, PPConfig0 */
     uint8_t ecp_fifo[16];       /* test FIFO (ECR mode 110) */
     uint8_t ecp_fifo_n;
-    uint8_t ecp_irq;
     MemoryRegion acpi_io;       /* 32 bytes at ACPIBAR */
     uint8_t acpi_regs[0x20];
     MemoryRegion pm_io;         /* 256 bytes at PMBAR */

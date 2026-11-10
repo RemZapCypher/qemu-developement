@@ -182,22 +182,17 @@ static const MemoryRegionOps ns87415_bmdma_ops = {
 };
 
 /* Device Control writes are shadowed per drive in 58h/59h/5Ch/5Dh. */
-static void ns87415_ctrl_write(IDEBus *bus, uint32_t addr, uint32_t val)
+static void ns87415_ctrl_write(void *opaque, uint32_t addr, uint32_t val)
 {
+    IDEBus *bus = opaque;
     PCIDevice *pd = PCI_DEVICE(BUS(bus)->parent);
 
     pd->config[NS87415_SHADOW(bus->bus_id, bus->unit)] = val;
     ide_ctrl_write(bus, addr, val);
 }
 
-static void ns87415_portio_ctrl_write(void *opaque, uint32_t addr,
-                                      uint32_t val)
-{
-    ns87415_ctrl_write(opaque, addr, val);
-}
-
 static const MemoryRegionPortio ns87415_portio2_list[] = {
-    { 0, 1, 1, .read = ide_status_read, .write = ns87415_portio_ctrl_write },
+    { 0, 1, 1, .read = ide_status_read, .write = ns87415_ctrl_write },
     PORTIO_END_OF_LIST(),
 };
 

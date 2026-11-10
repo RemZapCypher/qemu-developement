@@ -250,19 +250,25 @@ static int ns87560_route_of(NS87560LIOState *s, int src)
  * Rebuild every 8259 input from the source levels and the routing, so a
  * source moved away from an asserted input lowers it at once.
  */
-static void ns87560_router_recompute(NS87560LIOState *s, bool force)
+/* The 8259 inputs that the asserted sources drive through IRCR1-9 */
+static uint16_t ns87560_router_levels(NS87560LIOState *s)
 {
-    uint16_t new = 0, changed;
-    int src, irq;
+    uint16_t levels = 0;
+    int src;
 
     for (src = 0; src < NS87560_SRC_COUNT; src++) {
         if (s->src_level & BIT(src)) {
-            irq = ns87560_route_of(s, src);
-            if (irq) {
-                new |= BIT(irq);
-            }
+            levels |= BIT(ns87560_route_of(s, src));
         }
     }
+    return levels & ~BIT(0);    /* route 0: not routed */
+}
+
+static void ns87560_router_recompute(NS87560LIOState *s, bool force)
+{
+    uint16_t new = ns87560_router_levels(s), changed;
+    int irq;
+
     changed = force ? NS87560_IRQ_ROUTABLE : new ^ s->pic_level;
     s->pic_level = new;
     for (irq = 0; irq < ISA_NUM_IRQS; irq++) {
@@ -316,9 +322,6 @@ static void ns87560_periph_update(NS87560LIOState *s)
             /* sc->ss is unset while the serial core realizes */
             level &= sc->ss && ((sc->ss->mcr & (SCC_MCR_OUT2 | SCC_MCR_LOOP)) ||
                                 (sc->excr1 & EXCR1_EXT_SL));
-        }
-        if (n == 2) {
-            level |= s->ecp_irq;
         }
         ns87560_router_set_irq(s, src[n], level);
     }
@@ -789,10 +792,8 @@ static void ns87560_ecp_update_irq(NS87560LIOState *s)
 {
     if ((ecr_mode(s) == 2 || ecr_mode(s) == 3) && !(s->ecr & 0x0c)) {
         s->ecr |= 0x04;
-        s->ecp_irq = 1;
-        ns87560_periph_update(s);
-        s->ecp_irq = 0;
-        ns87560_periph_update(s);
+        ns87560_router_set_irq(s, NS87560_SRC_PP, 1);
+        ns87560_periph_update(s);           /* back to the port's level */
     }
 }
 
@@ -802,19 +803,12 @@ static void ns87560_ecp_send(NS87560LIOState *s, uint8_t b)
     ns87560_ecp_update_irq(s);
 }
 
+/* EIR index of Control0, Control2, Control4 and PPConfig0 -> edr[] */
 static int ecp_edr_slot(uint8_t eir)
 {
-    switch (eir) {
-    case 0:
-        return 0;
-    case 2:
-        return 1;
-    case 4:
-        return 2;
-    case 5:
-        return 3;
-    }
-    return -1;
+    static const int8_t slot[8] = { 0, -1, 1, -1, 2, 3, -1, -1 };
+
+    return eir < 8 ? slot[eir] : -1;
 }
 
 static uint64_t ns87560_ecp_read(void *opaque, hwaddr off, unsigned size)
@@ -925,7 +919,6 @@ static void ns87560_ecp_reset(NS87560LIOState *s)
     s->eir = 0;
     memset(s->edr, 0, sizeof(s->edr));
     s->ecp_fifo_n = 0;
-    s->ecp_irq = 0;
 }
 
 /*
@@ -1513,23 +1506,12 @@ static void ns87560_lio_reset_hold(Object *obj, ResetType type)
 static int ns87560_lio_post_load(void *opaque, int version_id)
 {
     NS87560LIOState *s = opaque;
-    int src, irq;
 
     /*
-     * The PICs migrate their own state; only rebuild the bookkeeping, do
-     * not drive their inputs again.
+     * The PICs migrate their own state, ELCR included; only rebuild the
+     * bookkeeping, do not drive their inputs again.
      */
-    s->pic_level = 0;
-    for (src = 0; src < NS87560_SRC_COUNT; src++) {
-        irq = ns87560_route_of(s, src);
-        if ((s->src_level & BIT(src)) && irq) {
-            s->pic_level |= BIT(irq);
-        }
-    }
-    I8259_COMMON(s->pic[0])->elcr = s->dev.config[CFG_ELCR] &
-                                  I8259_COMMON(s->pic[0])->elcr_mask;
-    I8259_COMMON(s->pic[1])->elcr = s->dev.config[CFG_ELCR + 1] &
-                                  I8259_COMMON(s->pic[1])->elcr_mask;
+    s->pic_level = ns87560_router_levels(s);
     scc_set_baudbase(&s->scc[0]);
     scc_set_baudbase(&s->scc[1]);
     ns87560_lio_decode_update(s);
