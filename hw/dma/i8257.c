@@ -80,6 +80,9 @@ static void i8257_write_page(void *opaque, uint32_t nport, uint32_t data)
         return;
     }
     d->regs[ichan].page = data;
+    if (d->pageh_autoclear) {
+        d->regs[ichan].pageh = 0;
+    }
 }
 
 static void i8257_write_pageh(void *opaque, uint32_t nport, uint32_t data)
@@ -177,6 +180,9 @@ static void i8257_write_chan(void *opaque, hwaddr nport, uint64_t data,
         i8257_init_chan(d, ichan);
     } else {
         r->base[nreg] = (r->base[nreg] & 0xff00) | (data & 0xff);
+    }
+    if (nreg == ADDR && d->pageh_autoclear) {
+        r->pageh = 0;
     }
 }
 
@@ -605,6 +611,7 @@ static const Property i8257_properties[] = {
     DEFINE_PROP_INT32("page-base", I8257State, page_base, 0x80),
     DEFINE_PROP_INT32("pageh-base", I8257State, pageh_base, 0x480),
     DEFINE_PROP_INT32("dshift", I8257State, dshift, 0),
+    DEFINE_PROP_BOOL("pageh-autoclear", I8257State, pageh_autoclear, false),
 };
 
 static void i8257_class_init(ObjectClass *klass, const void *data)

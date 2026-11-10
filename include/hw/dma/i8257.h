@@ -29,6 +29,8 @@ struct I8257State {
     int32_t page_base;
     int32_t pageh_base;
     int32_t dshift;
+    /* Writing a low page or base address clears the high page (PC87560) */
+    bool pageh_autoclear;
 
     uint8_t status;
     uint8_t command;
