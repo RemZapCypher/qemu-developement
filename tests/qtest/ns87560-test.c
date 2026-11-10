@@ -767,6 +767,77 @@ static void test_migration(void)
     unlink(path);
 }
 
+/* ssio(4) of OpenBSD/NetBSD: poll the master PIC, check spurious IRQ 7 */
+static int ssio_poll(QTestState *qts)
+{
+    int irq;
+
+    outb(qts, 0x20, 0x0c);                      /* OCW3 poll */
+    irq = inb(qts, 0x20) & 0x07;
+    if (irq == 7) {
+        outb(qts, 0x20, 0x0b);                  /* OCW3 read ISR */
+        if (!(inb(qts, 0x20) & 0x80)) {
+            return -1;                          /* spurious */
+        }
+    }
+    return irq;
+}
+
+/*
+ * The access pattern of the BSD ssio(4) driver (sys/arch/hppa/dev/ssio.c),
+ * which differs from Linux: ELCR set through a dword write at 64h, its own
+ * routing (PP on IRQ 7, IDE1 on 5, INTD on 1), every 8259 input unmasked,
+ * rotated priority, poll and specific EOI on the master only.
+ */
+static void test_bsd_ssio(void)
+{
+    QTestState *qts = qtest_init("-machine C3700,superio=ns87560 -nodefaults");
+    uint32_t r;
+
+    qtest_irq_intercept_out_named(qts, LIO_PATH, "intr");
+    r = cfg_readl(qts, 1, 0x64);
+    cfg_writel(qts, 1, 0x64, (r & 0x00ffffff) | (0x22u << 24));
+    cfg_writel(qts, 1, 0x68, (0x34 << 8) | (0x07 << 16) | (0x05 << 24));
+    cfg_writel(qts, 1, 0x6c, 0x10 << 8);
+    g_assert_cmphex(cfg_readb(qts, 1, 0x67), ==, 0x22);    /* IRQ1, 5 level */
+
+    outb(qts, 0x20, 0x11); outb(qts, 0x21, 0x00);
+    outb(qts, 0x21, 0x04); outb(qts, 0x21, 0x01);
+    outb(qts, 0x20, 0xc2);                      /* priority 3-7, 0-2 */
+    outb(qts, 0xa0, 0x11); outb(qts, 0xa1, 0x00);
+    outb(qts, 0xa1, 0x02); outb(qts, 0xa1, 0x01);
+    outb(qts, 0x21, 0x00); outb(qts, 0xa1, 0x00);
+    g_assert_false(qtest_get_irq(qts, 0));
+    /* Nothing pending: poll word bit 7 clear (ssio then EOIs level 0) */
+    outb(qts, 0x20, 0x0c);
+    g_assert_cmphex(inb(qts, 0x20) & 0x80, ==, 0);
+
+    /* IDE1 (level) and USB INTD (level) pending together: 5 before 1 */
+    qtest_set_irq_in(qts, LIO_PATH, "router-in", 4, 1);     /* IDE1 */
+    qtest_set_irq_in(qts, LIO_PATH, "router-in", 9, 1);     /* INTD */
+    g_assert_true(qtest_get_irq(qts, 0));
+    g_assert_cmpint(ssio_poll(qts), ==, 5);
+    qtest_set_irq_in(qts, LIO_PATH, "router-in", 4, 0);
+    outb(qts, 0x20, 0x65);                      /* specific EOI 5 */
+    g_assert_true(qtest_get_irq(qts, 0));       /* INTD still asserted */
+    g_assert_cmpint(ssio_poll(qts), ==, 1);
+    qtest_set_irq_in(qts, LIO_PATH, "router-in", 9, 0);
+    outb(qts, 0x20, 0x61);
+    g_assert_false(qtest_get_irq(qts, 0));
+
+    /* Parallel port on IRQ 7 (edge): a real request, not spurious */
+    qtest_set_irq_in(qts, LIO_PATH, "router-in", 2, 1);
+    qtest_set_irq_in(qts, LIO_PATH, "router-in", 2, 0);
+    g_assert_cmpint(ssio_poll(qts), ==, 7);
+    outb(qts, 0x20, 0x67);
+
+    /* The 8254 counts from reset: ssio unmasks IRQ 0 and sees it */
+    qtest_clock_step(qts, 100 * 1000 * 1000);
+    g_assert_cmpint(ssio_poll(qts), ==, 0);
+    outb(qts, 0x20, 0x60);
+    qtest_quit(qts);
+}
+
 static void test_uart_relocate(void)
 {
     QTestState *qts = qtest_init("-machine C3700,superio=ns87560 -nodefaults");
@@ -846,6 +917,7 @@ int main(int argc, char **argv)
     qtest_add_func("/ns87560/pp-ecp", test_pp_ecp);
     qtest_add_func("/ns87560/pm-block", test_pm_block);
     qtest_add_func("/ns87560/migration", test_migration);
+    qtest_add_func("/ns87560/bsd-ssio", test_bsd_ssio);
     qtest_add_func("/ns87560/acpi-usbreg", test_acpi_usbreg);
     qtest_add_func("/ns87560/acpi-usbreg-defaults", test_acpi_usbreg_defaults);
     return g_test_run();
