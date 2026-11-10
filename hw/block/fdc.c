@@ -681,6 +681,7 @@ enum {
     FD_CMD_VERIFY = 0x16,
     FD_CMD_POWERDOWN_MODE = 0x17,
     FD_CMD_PART_ID = 0x18,
+    FD_CMD_NSC_MODE = 0x01,
     FD_CMD_SCAN_LOW_OR_EQUAL = 0x19,
     FD_CMD_SCAN_HIGH_OR_EQUAL = 0x1d,
     FD_CMD_SAVE = 0x2e,
@@ -1932,8 +1933,17 @@ static void fdctrl_handle_version(FDCtrl *fdctrl, int direction)
 
 static void fdctrl_handle_partid(FDCtrl *fdctrl, int direction)
 {
-    fdctrl->fifo[0] = 0x41; /* Stepping 1 */
+    fdctrl->fifo[0] = fdctrl->part_id ?: 0x41; /* Stepping 1 */
     fdctrl_to_result_phase(fdctrl, 1);
+}
+
+/*
+ * National Semiconductor MODE: the parameters select timer, FIFO and
+ * low-power behaviour that the model does not have.  No result phase.
+ */
+static void fdctrl_handle_mode(FDCtrl *fdctrl, int direction)
+{
+    fdctrl_to_command_phase(fdctrl);
 }
 
 static void fdctrl_handle_restore(FDCtrl *fdctrl, int direction)
@@ -2246,17 +2256,21 @@ static const FDCtrlCommand handlers[] = {
     { FD_CMD_DUMPREG, 0xff, "DUMPREG", 0, fdctrl_handle_dumpreg },
     { FD_CMD_VERSION, 0xff, "VERSION", 0, fdctrl_handle_version },
     { FD_CMD_PART_ID, 0xff, "PART ID", 0, fdctrl_handle_partid },
+    { FD_CMD_NSC_MODE, 0xff, "MODE", 4, fdctrl_handle_mode },
     { FD_CMD_WRITE, 0x1f, "WRITE (BeOS)", 8, fdctrl_start_transfer, FD_DIR_WRITE }, /* not in specification ; BeOS 4.5 bug */
     { 0, 0, "unknown", 0, fdctrl_unimplemented }, /* default handler */
 };
 /* Associate command to an index in the 'handlers' array */
 static uint8_t command_to_handler[256];
 
-static const FDCtrlCommand *get_command(uint8_t cmd)
+static const FDCtrlCommand *get_command(FDCtrl *fdctrl, uint8_t cmd)
 {
     int idx;
 
     idx = command_to_handler[cmd];
+    if (handlers[idx].handler == fdctrl_handle_mode && !fdctrl->mode_cmd) {
+        idx = ARRAY_SIZE(handlers) - 1;
+    }
     FLOPPY_DPRINTF("%s command\n", handlers[idx].name);
     return &handlers[idx];
 }
@@ -2326,7 +2340,7 @@ static void fdctrl_write_data(FDCtrl *fdctrl, uint32_t value)
         if (pos == 0) {
             /* The first byte specifies the command. Now we start reading
              * as many parameters as this command requires. */
-            cmd = get_command(value);
+            cmd = get_command(fdctrl, value);
             fdctrl->data_len = cmd->parameters + 1;
             if (cmd->parameters) {
                 fdctrl->msr |= FD_MSR_RQM;
@@ -2343,7 +2357,7 @@ static void fdctrl_write_data(FDCtrl *fdctrl, uint32_t value)
                 break;
             }
 
-            cmd = get_command(fdctrl->fifo[0]);
+            cmd = get_command(fdctrl, fdctrl->fifo[0]);
             FLOPPY_DPRINTF("Calling handler for '%s'\n", cmd->name);
             cmd->handler(fdctrl, cmd->direction);
         }

@@ -134,6 +134,9 @@ struct FDCtrl {
     } qdev_for_drives[MAX_FD];
     int reset_sensei;
     FloppyDriveType fallback; /* type=auto failure fallback */
+    /* PART ID result, 0 = 41h; NSC MODE command accepted */
+    uint8_t part_id;
+    bool mode_cmd;
     /* Timers state */
     uint8_t timer0;
     uint8_t timer1;
