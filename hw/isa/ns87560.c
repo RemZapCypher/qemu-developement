@@ -1320,9 +1320,8 @@ static void ns87560_lio_instance_init(Object *obj)
     s->serial[1] = ISA_DEVICE(object_new(TYPE_ISA_SERIAL));
     object_property_add_child(obj, "serial[1]", OBJECT(s->serial[1]));
     object_unref(OBJECT(s->serial[1]));
-    s->parallel = ISA_DEVICE(object_new(TYPE_ISA_PARALLEL));
-    object_property_add_child(obj, "parallel", OBJECT(s->parallel));
-    object_unref(OBJECT(s->parallel));
+    s->parallel = ISA_DEVICE(object_new_with_props(TYPE_ISA_PARALLEL, obj,
+                                            "parallel", &error_abort, NULL));
 }
 
 static void ns87560_lio_realize(PCIDevice *d, Error **errp)
@@ -1389,7 +1388,6 @@ static void ns87560_lio_realize(PCIDevice *d, Error **errp)
                               8);
         memory_region_set_enabled(&s->scc[i].io, false);
         memory_region_add_subregion(io, 0, &s->scc[i].io);
-        ns87560_scc_reset(&s->scc[i]);
     }
     /* isa-parallel needs a backend; without one the port is absent. */
     if (!qemu_chr_fe_backend_connected(&ISA_PARALLEL(s->parallel)->state.chr)) {
@@ -1411,7 +1409,6 @@ static void ns87560_lio_realize(PCIDevice *d, Error **errp)
                               "ns87560-ecp-afifo", 1);
         memory_region_set_enabled(&s->ecp_afifo_io, false);
         memory_region_add_subregion_overlap(io, 0, &s->ecp_afifo_io, 1);
-        ns87560_ecp_reset(s);
     }
 
     /* 8254; its output 0 goes straight to 8259 input 0 (not routable). */
@@ -1467,7 +1464,6 @@ static void ns87560_lio_realize(PCIDevice *d, Error **errp)
                           "ns87560-fdc-cfg-data", 1);
     memory_region_set_enabled(&s->fdccfg_data_io, false);
     memory_region_add_subregion_overlap(io, 0, &s->fdccfg_data_io, 1);
-    ns87560_fdccfg_reset(s);
 
     memory_region_init_io(&s->acpi_io, OBJECT(d), &ns87560_acpi_ops, s,
                           "ns87560-acpi", sizeof(s->acpi_regs));
@@ -1476,9 +1472,8 @@ static void ns87560_lio_realize(PCIDevice *d, Error **errp)
     memory_region_init_io(&s->pm_io, OBJECT(d), &ns87560_pm_ops, s,
                           "ns87560-pm", 0x100);
     memory_region_add_subregion(io, 0xffffff00, &s->pm_io);
-    ns87560_pm_reset(s);
 
-    ns87560_lio_update_elcr(s);
+    /* Registers get their values in the reset hold phase */
     ns87560_lio_decode_update(s);
 }
 
@@ -1610,9 +1605,8 @@ static void ns87560_instance_init(Object *obj)
 {
     NS87560State *s = NS87560(obj);
 
-    s->lio = NS87560_LIO(object_new(TYPE_NS87560_LIO));
-    object_property_add_child(obj, "lio", OBJECT(s->lio));
-    object_unref(OBJECT(s->lio));
+    s->lio = NS87560_LIO(object_new_with_props(TYPE_NS87560_LIO, obj, "lio",
+                                               &error_abort, NULL));
     object_property_add_alias(obj, "chardev-sp1", OBJECT(s->lio->serial[0]),
                               "chardev");
     object_property_add_alias(obj, "chardev-sp2", OBJECT(s->lio->serial[1]),
