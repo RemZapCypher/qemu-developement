@@ -395,3 +395,8 @@ aspeed_udc_handle_data(int ep_nr, const char *dir, uint32_t iov, int ep_idx) "ep
 aspeed_udc_ep_data_in(unsigned ep, uint32_t rptr, uint32_t wptr, uint32_t iov) "ep %u, rptr %u, wptr %u, iov %u"
 aspeed_udc_ep_data_out(unsigned ep, uint32_t wptr, uint32_t avail, uint32_t iov) "ep %u, wptr %u, avail %u, iov %u"
 aspeed_udc_ep_ack(unsigned ep) "ep %u"
+
+# hcd-ohci-ns87560.c
+ns87560_ohci_nusb_read(uint64_t addr, unsigned size, uint32_t val) "addr 0x%"PRIx64" size %u val 0x%x"
+ns87560_ohci_nusb_write(uint64_t addr, unsigned size, uint64_t val) "addr 0x%"PRIx64" size %u val 0x%"PRIx64
+ns87560_ohci_cascade(int level) "level %d"

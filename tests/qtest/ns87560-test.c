@@ -375,6 +375,81 @@ static void test_ide_irq_erratum(void)
     qtest_quit(qts);
 }
 
+/* Elroy 0 PCI memory: PCI address A at ELROY0_MEM_CPU + (A - ELROY0_MEM) */
+#define ELROY0_MEM          0xf4000000u
+#define ELROY0_MEM_CPU      0xfffffffff4000000ULL
+#define OHCI_BAR            0xf4100000u
+#define NUSB_BAR            0xf4101000u
+
+/*
+ * Astro maps the distributed LMMIO window only when firmware programs it;
+ * qtest runs no firmware.  LMMIO_DIST_ROUTE 22: 4 MiB per rope.
+ */
+#define ASTRO_HPA_CPU       0xfffffffffed00000ULL
+#define ASTRO_LMMIO_ROUTE   0x370
+
+static void lmmio_enable(QTestState *qts)
+{
+    qtest_writeq(qts, ASTRO_HPA_CPU + ASTRO_LMMIO_ROUTE,
+                 bswap64(22ULL << 58));
+}
+
+static uint32_t mem_readl(QTestState *qts, uint32_t pci_addr)
+{
+    return bswap32(qtest_readl(qts, ELROY0_MEM_CPU + pci_addr - ELROY0_MEM));
+}
+
+static void mem_writel(QTestState *qts, uint32_t pci_addr, uint32_t val)
+{
+    qtest_writel(qts, ELROY0_MEM_CPU + pci_addr - ELROY0_MEM, bswap32(val));
+}
+
+/* Function 2 configuration space (PC87560UBD tables 142, p.292-294) */
+static void test_usb_config(void)
+{
+    QTestState *qts = qtest_init("-machine C3700,superio=ns87560 -nodefaults");
+
+    g_assert_cmphex(cfg_readl(qts, 2, 0x04), ==, 0x02000000);
+    g_assert_cmphex(cfg_readl(qts, 2, 0x3c), ==, 0x000004ff);
+    cfg_writel(qts, 2, 0x04, 0xffff);
+    g_assert_cmphex(cfg_readl(qts, 2, 0x04) & 0xffff, ==, 0x0147);
+    cfg_writel(qts, 2, 0x10, 0xffffffff);
+    cfg_writel(qts, 2, 0x14, 0xffffffff);
+    g_assert_cmphex(cfg_readl(qts, 2, 0x10), ==, 0xfffff000);
+    g_assert_cmphex(cfg_readl(qts, 2, 0x14), ==, 0xfffff000);
+    /* no device-specific registers */
+    cfg_writel(qts, 2, 0x40, 0xffffffff);
+    g_assert_cmphex(cfg_readl(qts, 2, 0x40), ==, 0);
+    qtest_quit(qts);
+}
+
+/*
+ * OHCI BAR: HcRevision 110h, three root-hub ports with port 1 tied off,
+ * Hce registers read 0; NUSBBAR reset values.
+ */
+static void test_usb_regs(void)
+{
+    QTestState *qts = qtest_init("-machine C3700,superio=ns87560 -nodefaults "
+                                 "-device usb-kbd,port=2");
+
+    lmmio_enable(qts);
+    cfg_writel(qts, 2, 0x10, OHCI_BAR);
+    cfg_writel(qts, 2, 0x14, NUSB_BAR);
+    cfg_writel(qts, 2, 0x04, 0x0006);
+    g_assert_cmphex(mem_readl(qts, OHCI_BAR + 0x00), ==, 0x00000110);
+    g_assert_cmphex(mem_readl(qts, OHCI_BAR + 0x48) & 0xff, ==, 3);
+    g_assert_cmphex(mem_readl(qts, OHCI_BAR + 0x54) & 1, ==, 0);
+    g_assert_cmphex(mem_readl(qts, OHCI_BAR + 0x58) & 1, ==, 1);
+    mem_writel(qts, OHCI_BAR + 0x100, 0xffffffff);
+    g_assert_cmphex(mem_readl(qts, OHCI_BAR + 0x100), ==, 0);
+
+    g_assert_cmphex(mem_readl(qts, NUSB_BAR + 0x00), ==, 0x00000014);
+    g_assert_cmphex(mem_readl(qts, NUSB_BAR + 0x34), ==, 0x000a0a0a);
+    mem_writel(qts, NUSB_BAR + 0x00, 0xffffffff);
+    g_assert_cmphex(mem_readl(qts, NUSB_BAR + 0x00), ==, 0xff0103ff);
+    qtest_quit(qts);
+}
+
 static void test_uart_relocate(void)
 {
     QTestState *qts = qtest_init("-machine C3700,superio=ns87560 -nodefaults");
@@ -442,6 +517,8 @@ int main(int argc, char **argv)
     qtest_add_func("/ns87560/ide-regs", test_ide_regs);
     qtest_add_func("/ns87560/ide-decode", test_ide_decode);
     qtest_add_func("/ns87560/ide-irq-erratum", test_ide_irq_erratum);
+    qtest_add_func("/ns87560/usb-config", test_usb_config);
+    qtest_add_func("/ns87560/usb-regs", test_usb_regs);
     qtest_add_func("/ns87560/acpi-usbreg", test_acpi_usbreg);
     qtest_add_func("/ns87560/acpi-usbreg-defaults", test_acpi_usbreg_defaults);
     return g_test_run();
