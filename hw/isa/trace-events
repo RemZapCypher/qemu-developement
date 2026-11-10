@@ -36,3 +36,5 @@ ns87560_cascade(int level) "CPUINT level %d"
 ns87560_decode(uint16_t fer, uint32_t sp1, uint32_t sp2, uint32_t pp, uint32_t acpi) "fer 0x%04x sp1 0x%x sp2 0x%x pp 0x%x acpi 0x%x"
 ns87560_acpi_read(uint32_t off, uint32_t val) "off 0x%x val 0x%x"
 ns87560_acpi_write(uint32_t off, uint32_t val) "off 0x%x val 0x%x"
+ns87560_fdc_cfg_mode(bool on) "FDC configuration mode %d"
+ns87560_fdc_cfg(int index, uint64_t val) "FDC config register %d <- 0x%02"PRIx64

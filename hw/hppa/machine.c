@@ -31,6 +31,8 @@
 #include "hw/pci-host/dino.h"
 #include "hw/isa/ns87560.h"
 #include "hw/ide/pci.h"
+#include "hw/block/fdc.h"
+#include "system/blockdev.h"
 #include "hw/misc/lasi.h"
 #include "hw/scsi/ncr53c710.h"
 #include "hw/scsi/lasi_ncr710.h"
@@ -847,6 +849,8 @@ static void machine_HP_C3700_init(MachineState *machine)
      */
     if (is_C3700 && HPPA_COMMON_MACHINE(machine)->ns87560) {
         DeviceState *sio = qdev_new(TYPE_NS87560);
+        DriveInfo *fd[MAX_FD];
+        int i;
 
         object_property_add_child(qdev_get_machine(), "ns87560", OBJECT(sio));
         object_property_set_link(OBJECT(sio), "bus", OBJECT(pci_bus),
@@ -856,6 +860,10 @@ static void machine_HP_C3700_init(MachineState *machine)
         qdev_prop_set_chr(sio, "chardev-pp", parallel_hds[0]);
         qdev_realize_and_unref(sio, NULL, &error_fatal);
         pci_ide_create_devs(NS87560(sio)->ide);
+        for (i = 0; i < MAX_FD; i++) {
+            fd[i] = drive_get(IF_FLOPPY, 0, i);
+        }
+        isa_fdc_init_drives(NS87560(sio)->lio->fdc, fd);
     } else if (is_C3700)  {
         PCIDevice *ide_pdev = pci_create_simple(pci_bus, PCI_DEVFN(2, 0),
                                                 "pc87560-ide");
