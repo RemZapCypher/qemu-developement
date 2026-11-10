@@ -268,6 +268,45 @@ static void test_irq_two_sources(void)
     qtest_quit(qts);
 }
 
+/* SP1 base register relocates the UART; 5Ah bit 1 disables it */
+static void test_uart_relocate(void)
+{
+    QTestState *qts = qtest_init("-machine C3700,superio=ns87560 -nodefaults");
+
+    outb(qts, 0x3ff, 0x5a);                     /* scratch register */
+    g_assert_cmphex(inb(qts, 0x3ff), ==, 0x5a);
+    cfg_writel(qts, 1, 0x94, 0x3e8);
+    outb(qts, 0x3ef, 0xa5);
+    g_assert_cmphex(inb(qts, 0x3ef), ==, 0xa5);
+    g_assert_cmphex(inb(qts, 0x3ff), ==, 0xff);   /* old base unclaimed */
+    cfg_writel(qts, 1, 0x58, 0xffbd0024);          /* 5Ah: SP1 off */
+    g_assert_cmphex(inb(qts, 0x3ef), ==, 0xff);
+    qtest_quit(qts);
+}
+
+/* Linux: outb(1, ACPIBAR + 1Fh) must read back bit 0 ("USB regulator") */
+static void check_acpi_usbreg(const char *args)
+{
+    QTestState *qts = qtest_init(args);
+    uint16_t base = cfg_readl(qts, 1, 0x88) & ~0x1f;
+
+    g_assert_cmphex(base, ==, 0x800);
+    outb(qts, base + 0x1f, 0x01);
+    g_assert_cmphex(inb(qts, base + 0x1f), ==, 0x01);
+    qtest_quit(qts);
+}
+
+static void test_acpi_usbreg(void)
+{
+    check_acpi_usbreg("-machine C3700,superio=ns87560 -nodefaults");
+}
+
+/* Same with default devices: firmware-placed BARs must not collide */
+static void test_acpi_usbreg_defaults(void)
+{
+    check_acpi_usbreg("-machine C3700,superio=ns87560");
+}
+
 static void test_superio_off(void)
 {
     QTestState *qts = qtest_init("-machine C3700 -nodefaults");
@@ -292,5 +331,8 @@ int main(int argc, char **argv)
     qtest_add_func("/ns87560/irq-route", test_irq_route);
     qtest_add_func("/ns87560/irq-ltim-ignored", test_irq_ltim_ignored);
     qtest_add_func("/ns87560/irq-two-sources", test_irq_two_sources);
+    qtest_add_func("/ns87560/uart-relocate", test_uart_relocate);
+    qtest_add_func("/ns87560/acpi-usbreg", test_acpi_usbreg);
+    qtest_add_func("/ns87560/acpi-usbreg-defaults", test_acpi_usbreg_defaults);
     return g_test_run();
 }

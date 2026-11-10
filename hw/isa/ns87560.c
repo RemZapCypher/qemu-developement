@@ -17,6 +17,9 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "hw/core/irq.h"
+#include "chardev/char-fe.h"
+#include "hw/char/parallel-isa.h"
+#include "hw/char/serial-isa.h"
 #include "hw/intc/i8259.h"
 #include "hw/isa/i8259_internal.h"
 #include "hw/isa/isa.h"
@@ -35,6 +38,15 @@
 #define NS87560_LIO_CMD_WMASK   0x014c  /* bits 2, 3, 6 and 8 are writable */
 #define NS87560_ACPIBAR_RESET   0x00000801  /* see ns87560_lio_regs[] */
 
+#define CFG_FER                 0x5a
+#define FER_SP1                 BIT(1)
+#define FER_SP2                 BIT(3)
+#define FER_PP                  BIT(5)
+#define FER_PIC                 BIT(9)
+#define CFG_ACPIBAR             0x88
+#define CFG_SP1BAR              0x94
+#define CFG_SP2BAR              0x98
+#define CFG_PPBAR               0x9c
 #define CFG_ELCR                0x67
 #define CFG_IRCR1               0x69
 #define CFG_IRCR9               0x71
@@ -244,6 +256,19 @@ static void ns87560_router_set_irq(void *opaque, int src, int level)
     ns87560_router_recompute(s, false);
 }
 
+/*
+ * Request lines of the ISA peripherals, installed in the ISA bus input
+ * table at their labels; IRCR1/IRCR2 decide where they really go.
+ */
+static void ns87560_periph_irq(void *opaque, int n, int level)
+{
+    static const int src[] = {
+        NS87560_SRC_SP1, NS87560_SRC_SP2, NS87560_SRC_PP, NS87560_SRC_FDC,
+    };
+
+    ns87560_router_set_irq(opaque, src[n], level);
+}
+
 /* Trigger mode comes from config 67h/68h; the chip has no I/O 4D0h/4D1h. */
 static void ns87560_lio_update_elcr(NS87560LIOState *s)
 {
@@ -299,6 +324,85 @@ static void ns87560_lio_i8259_irq(void *opaque, int n, int level)
     qemu_set_irq(s->cascade_out, level);
 }
 
+/* ---- Decode enables and relocation (5Ah, 84h-9Fh) ---------------------- */
+
+static hwaddr lio_win_base(NS87560LIOState *s, int off)
+{
+    return pci_get_long(s->dev.config + off) & ~7u;
+}
+
+static void ns87560_lio_decode_update(NS87560LIOState *s)
+{
+    uint16_t fer = pci_get_word(s->dev.config + CFG_FER);
+    uint32_t acpibar = pci_get_long(s->dev.config + CFG_ACPIBAR);
+    int i;
+
+    memory_region_transaction_begin();
+    for (i = 0; i < 2; i++) {
+        isa_serial_set_iobase(s->serial[i],
+                              lio_win_base(s, i ? CFG_SP2BAR : CFG_SP1BAR));
+        isa_serial_set_enabled(s->serial[i], fer & (i ? FER_SP2 : FER_SP1));
+    }
+    if (s->parallel) {
+        isa_parallel_set_iobase(s->parallel, lio_win_base(s, CFG_PPBAR));
+        isa_parallel_set_enabled(s->parallel, fer & FER_PP);
+    }
+    for (i = 0; i < 2; i++) {
+        memory_region_set_enabled(&I8259_COMMON(s->pic[i])->base_io,
+                                  fer & FER_PIC);
+        memory_region_set_enabled(&s->pic_cmd_io[i], fer & FER_PIC);
+    }
+    memory_region_set_address(&s->acpi_io, acpibar & ~0x1fu);
+    memory_region_set_enabled(&s->acpi_io, acpibar & 1);
+    memory_region_transaction_commit();
+    trace_ns87560_decode(fer, lio_win_base(s, CFG_SP1BAR),
+                         lio_win_base(s, CFG_SP2BAR),
+                         lio_win_base(s, CFG_PPBAR), acpibar & ~0x1fu);
+}
+
+/* ---- ACPI block (ACPIBAR, p.215 table 130) ------------------------------ */
+
+static const uint8_t acpi_wmask[0x20] = {
+    [0x02] = 0xff, [0x03] = 0xff, [0x04] = 0xff, [0x05] = 0xff,
+    [0x0e] = 0xff, [0x0f] = 0xff, [0x11] = 0xff, [0x12] = 0xff,
+    [0x1f] = 0x01,              /* USB regulator control */
+};
+static const uint8_t acpi_w1c[0x20] = {
+    [0x00] = 0xff, [0x01] = 0xff, [0x0c] = 0xff, [0x0d] = 0xff,
+    [0x10] = 0xff,
+};
+
+static uint64_t ns87560_acpi_read(void *opaque, hwaddr addr, unsigned size)
+{
+    NS87560LIOState *s = opaque;
+
+    trace_ns87560_acpi_read(addr, s->acpi_regs[addr]);
+    return s->acpi_regs[addr];
+}
+
+static void ns87560_acpi_write(void *opaque, hwaddr addr, uint64_t val,
+                               unsigned size)
+{
+    NS87560LIOState *s = opaque;
+    uint8_t *r = &s->acpi_regs[addr];
+
+    *r = (*r & ~acpi_wmask[addr]) | (val & acpi_wmask[addr]);
+    *r &= ~(val & acpi_w1c[addr]);
+    if ((addr == 0x05 && (val & 0x20)) || (addr == 0x12 && val)) {
+        qemu_log_mask(LOG_UNIMP, "ns87560: ACPI register 0x%02" HWADDR_PRIx
+                      " = 0x%02" PRIx64 " has no effect\n", addr, val);
+    }
+    trace_ns87560_acpi_write(addr, val);
+}
+
+static const MemoryRegionOps ns87560_acpi_ops = {
+    .read = ns87560_acpi_read,
+    .write = ns87560_acpi_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 1,
+};
+
 static void ns87560_lio_config_write(PCIDevice *d, uint32_t addr,
                                      uint32_t val, int len)
 {
@@ -321,6 +425,10 @@ static void ns87560_lio_config_write(PCIDevice *d, uint32_t addr,
             }
         }
     }
+    if (ranges_overlap(addr, len, CFG_FER, 2) ||
+        ranges_overlap(addr, len, 0x84, 0x1c)) {
+        ns87560_lio_decode_update(s);
+    }
     if (ranges_overlap(addr, len, CFG_ELCR, 2)) {
         ns87560_lio_update_elcr(s);
     }
@@ -341,6 +449,18 @@ static void ns87560_lio_instance_init(Object *obj)
     qdev_init_gpio_out_named(DEVICE(obj), &s->cascade_out,
                              NS87560_LIO_GPIO_INTR, 1);
     qemu_init_irq(&s->i8259_irq, ns87560_lio_i8259_irq, s, 0);
+    qdev_init_gpio_in_named(DEVICE(obj), ns87560_periph_irq, "periph-irq", 4);
+
+    /* Created here so that the container can alias their chardevs. */
+    s->serial[0] = ISA_DEVICE(object_new(TYPE_ISA_SERIAL));
+    object_property_add_child(obj, "serial[0]", OBJECT(s->serial[0]));
+    object_unref(OBJECT(s->serial[0]));
+    s->serial[1] = ISA_DEVICE(object_new(TYPE_ISA_SERIAL));
+    object_property_add_child(obj, "serial[1]", OBJECT(s->serial[1]));
+    object_unref(OBJECT(s->serial[1]));
+    s->parallel = ISA_DEVICE(object_new(TYPE_ISA_PARALLEL));
+    object_property_add_child(obj, "parallel", OBJECT(s->parallel));
+    object_unref(OBJECT(s->parallel));
 }
 
 static void ns87560_lio_realize(PCIDevice *d, Error **errp)
@@ -375,13 +495,47 @@ static void ns87560_lio_realize(PCIDevice *d, Error **errp)
                                             &s->pic_cmd_io[i], 1);
     }
 
-    /* Fixed 8259 inputs; routed peripherals are connected later. */
+    /*
+     * Fixed 8259 inputs go straight to the PICs.  The peripherals' "irq"
+     * properties are labels (their reset routes) that select the router.
+     */
     s->bus_irqs[0] = s->isa_irqs[0];
     s->bus_irqs[8] = s->isa_irqs[8];
     s->bus_irqs[13] = s->isa_irqs[13];
+    s->bus_irqs[4] = qdev_get_gpio_in_named(DEVICE(d), "periph-irq", 0);
+    s->bus_irqs[3] = qdev_get_gpio_in_named(DEVICE(d), "periph-irq", 1);
+    s->bus_irqs[5] = qdev_get_gpio_in_named(DEVICE(d), "periph-irq", 2);
+    s->bus_irqs[6] = qdev_get_gpio_in_named(DEVICE(d), "periph-irq", 3);
     isa_bus_register_input_irqs(s->isa_bus, s->bus_irqs);
 
+    for (i = 0; i < 2; i++) {
+        qdev_prop_set_uint32(DEVICE(s->serial[i]), "iobase",
+                             lio_win_base(s, i ? CFG_SP2BAR : CFG_SP1BAR));
+        qdev_prop_set_uint32(DEVICE(s->serial[i]), "irq", i ? 3 : 4);
+        if (!qdev_realize(DEVICE(s->serial[i]), BUS(s->isa_bus), errp)) {
+            return;
+        }
+    }
+    /* isa-parallel needs a backend; without one the port is absent. */
+    if (!qemu_chr_fe_backend_connected(&ISA_PARALLEL(s->parallel)->state.chr)) {
+        object_unparent(OBJECT(s->parallel));
+        s->parallel = NULL;
+    } else {
+        qdev_prop_set_uint32(DEVICE(s->parallel), "iobase",
+                             lio_win_base(s, CFG_PPBAR));
+        qdev_prop_set_uint32(DEVICE(s->parallel), "irq", 5);
+        if (!qdev_realize(DEVICE(s->parallel), BUS(s->isa_bus), errp)) {
+            return;
+        }
+    }
+
+    memory_region_init_io(&s->acpi_io, OBJECT(d), &ns87560_acpi_ops, s,
+                          "ns87560-acpi", sizeof(s->acpi_regs));
+    memory_region_set_enabled(&s->acpi_io, false);
+    memory_region_add_subregion(io, 0, &s->acpi_io);
+
     ns87560_lio_update_elcr(s);
+    ns87560_lio_decode_update(s);
 }
 
 static void ns87560_lio_reset_hold(Object *obj, ResetType type)
@@ -389,7 +543,9 @@ static void ns87560_lio_reset_hold(Object *obj, ResetType type)
     NS87560LIOState *s = NS87560_LIO(obj);
 
     ns87560_lio_config_defaults(s);
+    memset(s->acpi_regs, 0, sizeof(s->acpi_regs));
     ns87560_lio_update_elcr(s);
+    ns87560_lio_decode_update(s);
 }
 
 static int ns87560_lio_post_load(void *opaque, int version_id)
@@ -412,6 +568,7 @@ static int ns87560_lio_post_load(void *opaque, int version_id)
                                   I8259_COMMON(s->pic[0])->elcr_mask;
     I8259_COMMON(s->pic[1])->elcr = s->dev.config[CFG_ELCR + 1] &
                                   I8259_COMMON(s->pic[1])->elcr_mask;
+    ns87560_lio_decode_update(s);
     return 0;
 }
 
@@ -435,6 +592,7 @@ static const VMStateDescription vmstate_ns87560_lio = {
     .fields = (const VMStateField[]) {
         VMSTATE_PCI_DEVICE(dev, NS87560LIOState),
         VMSTATE_UINT32(src_level, NS87560LIOState),
+        VMSTATE_UINT8_ARRAY(acpi_regs, NS87560LIOState, 0x20),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -478,6 +636,12 @@ static void ns87560_instance_init(Object *obj)
     s->lio = NS87560_LIO(object_new(TYPE_NS87560_LIO));
     object_property_add_child(obj, "lio", OBJECT(s->lio));
     object_unref(OBJECT(s->lio));
+    object_property_add_alias(obj, "chardev-sp1", OBJECT(s->lio->serial[0]),
+                              "chardev");
+    object_property_add_alias(obj, "chardev-sp2", OBJECT(s->lio->serial[1]),
+                              "chardev");
+    object_property_add_alias(obj, "chardev-pp", OBJECT(s->lio->parallel),
+                              "chardev");
     qdev_init_gpio_in_named(DEVICE(obj), ns87560_usb_irq, "usb-irq", 1);
 }
 
@@ -501,6 +665,10 @@ static void ns87560_realize(DeviceState *dev, Error **errp)
     qdev_prop_set_bit(lio, "multifunction", true);
     if (!qdev_realize(lio, BUS(s->bus), errp)) {
         return;
+    }
+    if (!s->lio->parallel) {
+        /* The alias must not outlive the removed port. */
+        object_property_del(OBJECT(dev), "chardev-pp");
     }
 
     s->ide = pci_new_multifunction(PCI_DEVFN(s->slot, NS87560_FN_IDE),

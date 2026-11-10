@@ -452,7 +452,9 @@ static void machine_HP_common_init_tail(MachineState *machine, PCIBus *pci_bus,
     /* create USB OHCI controller for USB keyboard & mouse on Astro machines */
     if (!lasi_dev && machine->enable_graphics && defaults_enabled()) {
         USBBus *usb_bus;
-        if (create_diva) {
+        /* Unless the SuperIO chip provides one, add a USB controller */
+        if (create_diva ||
+            !object_resolve_type_unambiguous(TYPE_USB_BUS, NULL)) {
             pci_create_simple(pci_bus, -1, "pci-ohci");
         }
         usb_bus = USB_BUS(object_resolve_type_unambiguous(TYPE_USB_BUS,
@@ -848,6 +850,9 @@ static void machine_HP_C3700_init(MachineState *machine)
         object_property_add_child(qdev_get_machine(), "ns87560", OBJECT(sio));
         object_property_set_link(OBJECT(sio), "bus", OBJECT(pci_bus),
                                  &error_abort);
+        qdev_prop_set_chr(sio, "chardev-sp1", serial_hd(0));
+        qdev_prop_set_chr(sio, "chardev-sp2", serial_hd(1));
+        qdev_prop_set_chr(sio, "chardev-pp", parallel_hds[0]);
         qdev_realize_and_unref(sio, NULL, &error_fatal);
     } else if (is_C3700)  {
         PCIDevice *ide_pdev = pci_create_simple(pci_bus, PCI_DEVFN(2, 0),
