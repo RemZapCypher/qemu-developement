@@ -373,6 +373,9 @@ static void test_ide_irq_erratum(void)
 
     inb(qts, IDE_CMD_BASE + 7);                       /* status read acks */
     g_assert_false(qtest_get_irq(qts, 0));
+    /* Device Control writes are shadowed per drive (58h: channel 1, drive 0) */
+    outb(qts, IDE_CTL_BASE + 2, 0x02);
+    g_assert_cmphex(cfg_readb(qts, 0, 0x58), ==, 0x02);
     qtest_quit(qts);
 }
 
@@ -658,6 +661,8 @@ static void test_pp_ecp(void)
     /* Forward FIFO mode: serviceIntr is set once software clears it */
     outb(qts, ECP + 2, 0x40);
     g_assert_cmphex(inb(qts, ECP + 2) & 0x04, ==, 0x04);
+    outb(qts, 0x20, 0x0a);                           /* the pulse latched */
+    g_assert_cmphex(inb(qts, 0x20) & 0x20, ==, 0x20); /* PP -> IRQ 5, edge */
 
     cfg_writel(qts, 1, 0x5c, 0);
     g_assert_cmphex(inb(qts, ECP + 2), ==, 0xff);
@@ -721,6 +726,9 @@ static void test_migration(void)
 
     outb(src, 0x21, 0xa5);                              /* PIC IMR */
     cfg_writel(src, 1, 0x94, 0x3e9);                    /* SP1 -> 3E8h */
+    cfg_writel(src, 1, 0x64, 0x10u << 24);              /* IRQ 4 level */
+    outb(src, 0x3e8 + 1, 0x02);                         /* SP1 THRE irq */
+    outb(src, 0x3e8 + 4, 0x08);                         /* OUT2 */
     outb(src, 0x3e8 + 7, 0x5a);                         /* scratch */
     outb(src, 0x3e8 + 3, 0xe4);                         /* bank 3 */
     ide_go_native(src);
@@ -753,6 +761,11 @@ static void test_migration(void)
     g_assert_cmphex(inb(dst, 0x3e8 + 3), ==, 0xe4);
     g_assert_cmphex(inb(dst, 0x3e8 + 0), ==, 0x20);     /* bank 3 DID */
     outb(dst, 0x3e8 + 3, 0x03);
+    /* The pending level survived, and releasing it reaches the 8259 */
+    outb(dst, 0x20, 0x0a);
+    g_assert_cmphex(inb(dst, 0x20) & 0x10, ==, 0x10);
+    outb(dst, 0x3e8 + 1, 0x00);
+    g_assert_cmphex(inb(dst, 0x20) & 0x10, ==, 0);
     g_assert_cmphex(inb(dst, 0x3e8 + 7), ==, 0x5a);
     g_assert_cmphex(cfg_readb(dst, 0, 0x09), ==, 0x8f);
     g_assert_cmphex(inb(dst, IDE_CMD_BASE + 7), ==, 0x50);
