@@ -399,4 +399,3 @@ aspeed_udc_ep_ack(unsigned ep) "ep %u"
 # hcd-ohci-ns87560.c
 ns87560_ohci_nusb_read(uint64_t addr, unsigned size, uint32_t val) "addr 0x%"PRIx64" size %u val 0x%x"
 ns87560_ohci_nusb_write(uint64_t addr, unsigned size, uint64_t val) "addr 0x%"PRIx64" size %u val 0x%"PRIx64
-ns87560_ohci_cascade(int level) "level %d"

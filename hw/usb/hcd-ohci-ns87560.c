@@ -195,7 +195,6 @@ static const MemoryRegionOps ns87560_ohci_nusb_ops = {
  */
 static void ns87560_ohci_cascade(void *opaque, int n, int level)
 {
-    trace_ns87560_ohci_cascade(level);
     pci_set_irq(PCI_DEVICE(opaque), level);
 }
 

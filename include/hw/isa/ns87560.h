@@ -136,7 +136,6 @@ struct NS87560State {
 
     PCIDevice *ide;
     NS87560LIOState *lio;
-    PCIDevice *usb;
 
     qemu_irq usb_split[2];
 };

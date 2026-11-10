@@ -1270,16 +1270,17 @@ static void ns87560_lio_config_write(PCIDevice *d, uint32_t addr,
 
     if (ranges_overlap(addr, len, CFG_ARB, 2)) {
         /* Two equal priority fields select rotate mode (p.277). */
-        uint16_t v = pci_get_word(d->config + CFG_ARB) & 0x7fff;
-        int i, j;
+        uint16_t v = pci_get_word(d->config + CFG_ARB);
+        unsigned seen = 0, prio;
+        int i;
 
         for (i = 0; i < 5; i++) {
-            for (j = i + 1; j < 5; j++) {
-                if (((v >> (3 * i)) & 7) == ((v >> (3 * j)) & 7)) {
-                    pci_set_word(d->config + CFG_ARB, NS87560_ARB_ROTATE);
-                    i = j = 5;
-                }
+            prio = BIT((v >> (3 * i)) & 7);
+            if (seen & prio) {
+                pci_set_word(d->config + CFG_ARB, NS87560_ARB_ROTATE);
+                break;
             }
+            seen |= prio;
         }
     }
     if (ranges_overlap(addr, len, CFG_FER, 2) ||
@@ -1643,6 +1644,7 @@ static void ns87560_realize(DeviceState *dev, Error **errp)
 {
     NS87560State *s = NS87560(dev);
     DeviceState *lio = DEVICE(s->lio);
+    PCIDevice *usb;
     int n;
 
     if (!s->bus) {
@@ -1679,22 +1681,22 @@ static void ns87560_realize(DeviceState *dev, Error **errp)
                                    NS87560_SRC_IDE1 + n));
     }
 
-    s->usb = pci_new_multifunction(PCI_DEVFN(s->slot, NS87560_FN_USB),
+    usb = pci_new_multifunction(PCI_DEVFN(s->slot, NS87560_FN_USB),
                                    TYPE_NS87560_OHCI);
-    object_property_add_child(OBJECT(dev), "usb", OBJECT(s->usb));
-    if (!pci_realize_and_unref(s->usb, s->bus, errp)) {
+    object_property_add_child(OBJECT(dev), "usb", OBJECT(usb));
+    if (!pci_realize_and_unref(usb, s->bus, errp)) {
         return;
     }
     s->usb_split[0] = qdev_get_gpio_in_named(lio, NS87560_LIO_GPIO_ROUTER,
                                              NS87560_SRC_USB);
     s->usb_split[1] = qdev_get_gpio_in_named(lio, NS87560_LIO_GPIO_ROUTER,
                                              NS87560_SRC_INTD);
-    qdev_connect_gpio_out_named(DEVICE(s->usb), NS87560_OHCI_GPIO_IRQ, 0,
+    qdev_connect_gpio_out_named(DEVICE(usb), NS87560_OHCI_GPIO_IRQ, 0,
                                 qdev_get_gpio_in_named(dev, "usb-irq", 0));
 
     /* The 8259 master output reaches the host through function 2's INTD. */
     qdev_connect_gpio_out_named(lio, NS87560_LIO_GPIO_INTR, 0,
-        qdev_get_gpio_in_named(DEVICE(s->usb), NS87560_OHCI_GPIO_CASCADE, 0));
+        qdev_get_gpio_in_named(DEVICE(usb), NS87560_OHCI_GPIO_CASCADE, 0));
 }
 
 static const Property ns87560_properties[] = {
