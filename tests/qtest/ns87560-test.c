@@ -526,6 +526,51 @@ static void test_dma_hipage(void)
     qtest_quit(qts);
 }
 
+/* 8254 at 40h, port 61h gate/OUT2, 5Ah bit 10 decode (p.392, ch. 20) */
+static void test_pit(void)
+{
+    QTestState *qts = qtest_init("-machine C3700,superio=ns87560 -nodefaults");
+    uint32_t fer;
+    uint8_t a, b;
+
+    outb(qts, 0x61, 0x01);                      /* gate counter 2 */
+    outb(qts, 0x43, 0xb0);                      /* ch2, lo/hi, mode 0 */
+    outb(qts, 0x42, 0x34);
+    outb(qts, 0x42, 0x12);
+    outb(qts, 0x43, 0x80);                      /* latch ch2 */
+    g_assert_cmphex(inb(qts, 0x42), ==, 0x34);
+    g_assert_cmphex(inb(qts, 0x42), ==, 0x12);
+
+    a = inb(qts, 0x61);
+    b = inb(qts, 0x61);
+    g_assert_cmphex(a & 0x2f, ==, 0x01);         /* gate on, OUT2 low */
+    g_assert_cmphex((a ^ b) & 0x10, ==, 0x10);   /* refresh toggles */
+    qtest_clock_step(qts, 10 * 1000 * 1000);     /* > 0x1234 ticks */
+    g_assert_cmphex(inb(qts, 0x61) & 0x20, ==, 0x20);
+
+    fer = cfg_readl(qts, 1, 0x58);
+    cfg_writel(qts, 1, 0x58, fer & ~(1u << 26)); /* 5Ah bit 10 */
+    outb(qts, 0x43, 0x80);
+    g_assert_cmphex(inb(qts, 0x42), ==, 0xff);
+    qtest_quit(qts);
+}
+
+/* Port 92h sticky bits, APM B2h/B3h storage (p.389-390, p.394-395) */
+static void test_fixed_ports(void)
+{
+    QTestState *qts = qtest_init("-machine C3700,superio=ns87560 -nodefaults");
+
+    outb(qts, 0x92, 0xff);
+    g_assert_cmphex(inb(qts, 0x92), ==, 0x2b);
+    outb(qts, 0x92, 0x00);
+    g_assert_cmphex(inb(qts, 0x92), ==, 0x28);
+    outb(qts, 0xb2, 0x5a);
+    outb(qts, 0xb3, 0xa5);
+    g_assert_cmphex(inb(qts, 0xb2), ==, 0x5a);
+    g_assert_cmphex(inb(qts, 0xb3), ==, 0xa5);
+    qtest_quit(qts);
+}
+
 static void test_uart_relocate(void)
 {
     QTestState *qts = qtest_init("-machine C3700,superio=ns87560 -nodefaults");
@@ -598,6 +643,8 @@ int main(int argc, char **argv)
     qtest_add_func("/ns87560/fdc-commands", test_fdc_commands);
     qtest_add_func("/ns87560/fdc-config-mode", test_fdc_config_mode);
     qtest_add_func("/ns87560/dma-hipage", test_dma_hipage);
+    qtest_add_func("/ns87560/pit", test_pit);
+    qtest_add_func("/ns87560/fixed-ports", test_fixed_ports);
     qtest_add_func("/ns87560/acpi-usbreg", test_acpi_usbreg);
     qtest_add_func("/ns87560/acpi-usbreg-defaults", test_acpi_usbreg_defaults);
     return g_test_run();

@@ -28,6 +28,8 @@
 #include "hw/pci/pci.h"
 #include "hw/pci/pci_ids.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/timer/i8254.h"
+#include "hw/timer/i8254_internal.h"
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -46,7 +48,11 @@
 #define FER_SP2                 BIT(3)
 #define FER_IDE2                BIT(4)
 #define FER_PP                  BIT(5)
+#define FER_P92                 BIT(7)
 #define FER_PIC                 BIT(9)
+#define FER_PIT                 BIT(10)
+#define FER_P61                 BIT(14)
+#define FER_APM                 BIT(15)
 #define FER_DMA1                BIT(11)
 #define FER_DMA2                BIT(12)
 #define CFG_SFE                 0x5d
@@ -366,6 +372,10 @@ static void ns87560_lio_decode_update(NS87560LIOState *s)
         portio_list_set_enabled(&s->dma[i]->portio_page, en);
     }
     memory_region_set_enabled(&s->dma_hipage_io, fer & (FER_DMA1 | FER_DMA2));
+    memory_region_set_enabled(&s->pit->ioports, fer & FER_PIT);
+    memory_region_set_enabled(&s->port61_io, fer & FER_P61);
+    memory_region_set_enabled(&s->port92_io, fer & FER_P92);
+    memory_region_set_enabled(&s->apm_io, fer & FER_APM);
     for (i = 0; i < 2; i++) {
         isa_serial_set_iobase(s->serial[i],
                               lio_win_base(s, i ? CFG_SP2BAR : CFG_SP1BAR));
@@ -401,6 +411,81 @@ static const uint8_t acpi_wmask[0x20] = {
 static const uint8_t acpi_w1c[0x20] = {
     [0x00] = 0xff, [0x01] = 0xff, [0x0c] = 0xff, [0x0d] = 0xff,
     [0x10] = 0xff,
+};
+
+/*
+ * Port 61h (p.392): bit 0 gates PIT counter 2, bit 1 is speaker data,
+ * bits 2/3 disable the NMI sources; bit 4 toggles on each read
+ * (refresh), bit 5 is counter 2's output.  No NMI sources: bits 6/7 read 0.
+ */
+static uint64_t ns87560_port61_read(void *opaque, hwaddr addr, unsigned size)
+{
+    NS87560LIOState *s = opaque;
+    PITChannelInfo ch;
+
+    pit_get_channel_info(s->pit, 2, &ch);
+    s->port61 ^= BIT(4);
+    return (s->port61 & 0x1e) | (ch.gate & 1) | (ch.out << 5);
+}
+
+static void ns87560_port61_write(void *opaque, hwaddr addr, uint64_t val,
+                                 unsigned size)
+{
+    NS87560LIOState *s = opaque;
+
+    s->port61 = (s->port61 & BIT(4)) | (val & 0x0f);
+    pit_set_gate(s->pit, 2, val & 1);
+}
+
+static const MemoryRegionOps ns87560_port61_ops = {
+    .read = ns87560_port61_read,
+    .write = ns87560_port61_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 1 },
+};
+
+/*
+ * Port 92h (p.389-390): bit 0 is the fast CPU init (no effect on
+ * PA-RISC), bit 1 A20 gate; bits 3 and 5 can only be set until reset.
+ */
+static uint64_t ns87560_port92_read(void *opaque, hwaddr addr, unsigned size)
+{
+    return ((NS87560LIOState *)opaque)->port92;
+}
+
+static void ns87560_port92_write(void *opaque, hwaddr addr, uint64_t val,
+                                 unsigned size)
+{
+    NS87560LIOState *s = opaque;
+
+    s->port92 = (val & 0x2b) | (s->port92 & 0x28);
+}
+
+static const MemoryRegionOps ns87560_port92_ops = {
+    .read = ns87560_port92_read,
+    .write = ns87560_port92_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 1 },
+};
+
+/* APM control/status B2h-B3h (p.394-395): storage, there is no SMI. */
+static uint64_t ns87560_apm_read(void *opaque, hwaddr addr, unsigned size)
+{
+    return ((NS87560LIOState *)opaque)->apm[addr];
+}
+
+static void ns87560_apm_write(void *opaque, hwaddr addr, uint64_t val,
+                              unsigned size)
+{
+    ((NS87560LIOState *)opaque)->apm[addr] = val;
+}
+
+static const MemoryRegionOps ns87560_apm_ops = {
+    .read = ns87560_apm_read,
+    .write = ns87560_apm_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 2 },
+    .impl = { .min_access_size = 1, .max_access_size = 1 },
 };
 
 /*
@@ -732,6 +817,18 @@ static void ns87560_lio_realize(PCIDevice *d, Error **errp)
         }
     }
 
+    /* 8254; its output 0 goes straight to 8259 input 0 (not routable). */
+    s->pit = PIT_COMMON(i8254_pit_init(s->isa_bus, 0x40, 0, NULL));
+    memory_region_init_io(&s->port61_io, OBJECT(d), &ns87560_port61_ops, s,
+                          "ns87560-port61", 1);
+    memory_region_add_subregion(io, 0x61, &s->port61_io);
+    memory_region_init_io(&s->port92_io, OBJECT(d), &ns87560_port92_ops, s,
+                          "ns87560-port92", 1);
+    memory_region_add_subregion(io, 0x92, &s->port92_io);
+    memory_region_init_io(&s->apm_io, OBJECT(d), &ns87560_apm_ops, s,
+                          "ns87560-apm", 2);
+    memory_region_add_subregion(io, 0xb2, &s->apm_io);
+
     /* 8237 pair; fn1 owns the high page registers (480h-48Fh). */
     for (i = 0; i < 2; i++) {
         ISADevice *dma = isa_new(TYPE_I8257);
@@ -790,6 +887,9 @@ static void ns87560_lio_reset_hold(Object *obj, ResetType type)
     ns87560_lio_config_defaults(s);
     memset(s->acpi_regs, 0, sizeof(s->acpi_regs));
     ns87560_fdccfg_reset(s);
+    s->port61 = 0;
+    s->port92 = 0;
+    memset(s->apm, 0, sizeof(s->apm));
     ns87560_lio_update_elcr(s);
     ns87560_lio_decode_update(s);
 }
@@ -842,6 +942,9 @@ static const VMStateDescription vmstate_ns87560_lio = {
         VMSTATE_UINT8_ARRAY(fdccfg, NS87560LIOState, 10),
         VMSTATE_UINT8(fdccfg_index, NS87560LIOState),
         VMSTATE_BOOL(fdccfg_mode, NS87560LIOState),
+        VMSTATE_UINT8(port61, NS87560LIOState),
+        VMSTATE_UINT8(port92, NS87560LIOState),
+        VMSTATE_UINT8_ARRAY(apm, NS87560LIOState, 2),
         VMSTATE_END_OF_LIST()
     }
 };
