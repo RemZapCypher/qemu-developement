@@ -37,7 +37,8 @@
 #include "trace.h"
 
 #define NS87560_LIO_REVISION    0x01
-#define NS87560_LIO_CMD_RESET   0x000f  /* I/O, memory, master, special cycles */
+/* I/O, memory, bus master, special cycles */
+#define NS87560_LIO_CMD_RESET   0x000f
 #define NS87560_LIO_CMD_WMASK   0x014c  /* bits 2, 3, 6 and 8 are writable */
 #define NS87560_ACPIBAR_RESET   0x00000801  /* see ns87560_lio_regs[] */
 
@@ -134,7 +135,7 @@ static const NS87560LIOReg ns87560_lio_regs[] = {
     { 0x74, 2, 0x0000,     0xfffe,     0,          "FX region 2 mask" },
     { 0x76, 2, 0x0000,     0xffff,     0,          "FX timing" },
     { 0x78, 1, 0x00,       0x0f,       0,          "FX bus control" },
-    { 0x79, 1, 0x00,       0xff,       0x70,       "native IRQ pins (GPIO4-6)" },
+    { 0x79, 1, 0x00,       0xff,       0x70,       "native IRQ pins" },
     { 0x7a, 1, 0x00,       0xff,       0,          "GPIO direction" },
     { 0x7b, 1, 0x00,       0xff,       0x80,       "serial IRQ" },
     { 0x7c, 2, 0x0000,     0xef7f,     0,          "serial IRQ enable" },
@@ -1356,8 +1357,9 @@ static void ns87560_lio_realize(PCIDevice *d, Error **errp)
         memory_region_set_enabled(&p->elcr_io, false);
         /* QEMU's F8h would keep IRQ1 edge-triggered; Linux needs level. */
         p->elcr_mask = i ? NS87560_ELCR_MASK_SLAVE : NS87560_ELCR_MASK_MASTER;
-        memory_region_init_io(&s->pic_cmd_io[i], OBJECT(d), &ns87560_pic_cmd_ops,
-                              p, i ? "ns87560-pic2-cmd" : "ns87560-pic1-cmd", 1);
+        memory_region_init_io(&s->pic_cmd_io[i], OBJECT(d),
+                              &ns87560_pic_cmd_ops, p,
+                              i ? "ns87560-pic2-cmd" : "ns87560-pic1-cmd", 1);
         memory_region_add_subregion_overlap(io, i ? 0xa0 : 0x20,
                                             &s->pic_cmd_io[i], 1);
     }
@@ -1411,7 +1413,8 @@ static void ns87560_lio_realize(PCIDevice *d, Error **errp)
         memory_region_set_enabled(&s->ecp_io, false);
         memory_region_add_subregion_overlap(io, 0, &s->ecp_io, 1);
         memory_region_init_io(&s->ecp_afifo_io, OBJECT(d),
-                              &ns87560_ecp_afifo_ops, s, "ns87560-ecp-afifo", 1);
+                              &ns87560_ecp_afifo_ops, s,
+                              "ns87560-ecp-afifo", 1);
         memory_region_set_enabled(&s->ecp_afifo_io, false);
         memory_region_add_subregion_overlap(io, 0, &s->ecp_afifo_io, 1);
         ns87560_ecp_reset(s);
@@ -1466,7 +1469,8 @@ static void ns87560_lio_realize(PCIDevice *d, Error **errp)
     memory_region_set_enabled(&s->fdccfg_idx_io, false);
     memory_region_add_subregion(io, 0, &s->fdccfg_idx_io);
     memory_region_init_io(&s->fdccfg_data_io, OBJECT(d),
-                          &ns87560_fdccfg_data_ops, s, "ns87560-fdc-cfg-data", 1);
+                          &ns87560_fdccfg_data_ops, s,
+                          "ns87560-fdc-cfg-data", 1);
     memory_region_set_enabled(&s->fdccfg_data_io, false);
     memory_region_add_subregion_overlap(io, 0, &s->fdccfg_data_io, 1);
     ns87560_fdccfg_reset(s);
