@@ -571,6 +571,66 @@ static void test_fixed_ports(void)
     qtest_quit(qts);
 }
 
+#define SP1     0x3f8
+
+/* SCC register banks (PC87560UBD p.338-350) */
+static void test_uart_banks(void)
+{
+    QTestState *qts = qtest_init("-machine C3700,superio=ns87560 -nodefaults");
+
+    outb(qts, SP1 + 3, 0xe4);                   /* bank 3 */
+    g_assert_cmphex(inb(qts, SP1 + 0), ==, 0x20);   /* module ID */
+    g_assert_cmphex(inb(qts, SP1 + 1), ==, 0x00);   /* shadow LCR */
+    g_assert_cmphex(inb(qts, SP1 + 3), ==, 0xe4);   /* BSR */
+
+    /* Bank 2 divisor: no fallback, visible through bank 1 */
+    outb(qts, SP1 + 3, 0xe0);
+    outb(qts, SP1 + 0, 0x0c);
+    outb(qts, SP1 + 1, 0x00);
+    g_assert_cmphex(inb(qts, SP1 + 0), ==, 0x0c);
+    outb(qts, SP1 + 3, 0x83);                   /* bank 1 = DLAB */
+    g_assert_cmphex(inb(qts, SP1 + 0), ==, 0x0c);
+    outb(qts, SP1 + 3, 0x03);                   /* bank 0, 8N1 */
+    outb(qts, SP1 + 3, 0xe4);
+    g_assert_cmphex(inb(qts, SP1 + 1), ==, 0x03);
+
+    /* Extended mode: IER bits 7:4; a bank 1 divisor access falls back */
+    outb(qts, SP1 + 3, 0xe0);
+    outb(qts, SP1 + 2, 0x01);                   /* EXCR1.EXT_SL */
+    outb(qts, SP1 + 3, 0x03);
+    outb(qts, SP1 + 1, 0xf0);
+    g_assert_cmphex(inb(qts, SP1 + 1), ==, 0xf0);
+    outb(qts, SP1 + 3, 0x83);
+    inb(qts, SP1 + 0);
+    outb(qts, SP1 + 3, 0xe0);
+    g_assert_cmphex(inb(qts, SP1 + 2), ==, 0x00);
+    outb(qts, SP1 + 3, 0x03);
+    g_assert_cmphex(inb(qts, SP1 + 1), ==, 0x00);
+
+    /* Divisor lock: bank 1 offsets 0/1 become scratch storage */
+    outb(qts, SP1 + 3, 0xe0);
+    outb(qts, SP1 + 4, 0x80);                   /* EXCR2.LOCK */
+    outb(qts, SP1 + 3, 0x83);
+    outb(qts, SP1 + 0, 0x55);
+    g_assert_cmphex(inb(qts, SP1 + 0), ==, 0x55);
+    outb(qts, SP1 + 3, 0xe0);
+    g_assert_cmphex(inb(qts, SP1 + 0), ==, 0x0c);
+    qtest_quit(qts);
+}
+
+/* MCR.OUT2 gates the UART interrupt in non-extended mode (p.338) */
+static void test_uart_out2(void)
+{
+    QTestState *qts = qtest_init("-machine C3700,superio=ns87560 -nodefaults");
+
+    outb(qts, 0x20, 0x0a);                      /* OCW3: read IRR */
+    outb(qts, SP1 + 1, 0x02);                   /* IER: THRE */
+    g_assert_cmphex(inb(qts, 0x20) & 0x10, ==, 0);
+    outb(qts, SP1 + 4, 0x08);                   /* MCR.OUT2 */
+    g_assert_cmphex(inb(qts, 0x20) & 0x10, ==, 0x10);
+    qtest_quit(qts);
+}
+
 static void test_uart_relocate(void)
 {
     QTestState *qts = qtest_init("-machine C3700,superio=ns87560 -nodefaults");
@@ -645,6 +705,8 @@ int main(int argc, char **argv)
     qtest_add_func("/ns87560/dma-hipage", test_dma_hipage);
     qtest_add_func("/ns87560/pit", test_pit);
     qtest_add_func("/ns87560/fixed-ports", test_fixed_ports);
+    qtest_add_func("/ns87560/uart-banks", test_uart_banks);
+    qtest_add_func("/ns87560/uart-out2", test_uart_out2);
     qtest_add_func("/ns87560/acpi-usbreg", test_acpi_usbreg);
     qtest_add_func("/ns87560/acpi-usbreg-defaults", test_acpi_usbreg_defaults);
     return g_test_run();
