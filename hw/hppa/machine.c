@@ -29,6 +29,7 @@
 #include "hw/pci/pci_device.h"
 #include "hw/pci-host/astro.h"
 #include "hw/pci-host/dino.h"
+#include "hw/isa/ns87560.h"
 #include "hw/misc/lasi.h"
 #include "hw/scsi/ncr53c710.h"
 #include "hw/scsi/lasi_ncr710.h"
@@ -46,6 +47,7 @@ struct HppaMachineState {
 
     DeviceState *lasi_dev;
     uint64_t memsplit_addr;
+    bool ns87560;               /* C3700: superio=ns87560 */
 };
 
 #define MIN_SEABIOS_HPPA_VERSION 26 /* require at least this fw version */
@@ -835,8 +837,18 @@ static void machine_HP_C3700_init(MachineState *machine)
     pci_bus = PCI_BUS(qdev_get_child_bus(DEVICE(astro->elroy[0]), "pci"));
     assert(pci_bus);
 
-    /* The C3700 has a SuperIO chip, while the A400 hasn't. */
-    if (is_C3700)  {
+    /*
+     * The C3700 has a SuperIO chip, while the A400 hasn't.  "superio=ns87560"
+     * selects the NS87560 model, at the chip's real slot 14, instead of the
+     * default pc87560 model at slot 2.
+     */
+    if (is_C3700 && HPPA_COMMON_MACHINE(machine)->ns87560) {
+        DeviceState *sio = qdev_new(TYPE_NS87560);
+
+        object_property_set_link(OBJECT(sio), "bus", OBJECT(pci_bus),
+                                 &error_abort);
+        qdev_realize_and_unref(sio, NULL, &error_fatal);
+    } else if (is_C3700)  {
         PCIDevice *ide_pdev = pci_create_simple(pci_bus, PCI_DEVFN(2, 0),
                                                 "pc87560-ide");
         PCIDevice *usb_pdev = pci_create_simple(pci_bus, PCI_DEVFN(2, 2),
@@ -879,6 +891,22 @@ static void machine_HP_A400_init(MachineState *machine)
     hpm = HPPA_COMMON_MACHINE(machine);
     hpm->memsplit_addr = 1 * GiB;
     machine_HP_C3700_init(machine);
+}
+
+static char *c3700_get_superio(Object *obj, Error **errp)
+{
+    return g_strdup(HPPA_COMMON_MACHINE(obj)->ns87560 ? "ns87560" : "pc87560");
+}
+
+static void c3700_set_superio(Object *obj, const char *value, Error **errp)
+{
+    if (!strcmp(value, "ns87560")) {
+        HPPA_COMMON_MACHINE(obj)->ns87560 = true;
+    } else if (!strcmp(value, "pc87560")) {
+        HPPA_COMMON_MACHINE(obj)->ns87560 = false;
+    } else {
+        error_setg(errp, "superio must be 'pc87560' or 'ns87560'");
+    }
 }
 
 static void hppa_machine_reset(MachineState *ms, ResetType type)
@@ -1006,6 +1034,12 @@ static void HP_C3700_machine_init_class_init(ObjectClass *oc, const void *data)
     mc->init = machine_HP_C3700_init;
     mc->max_cpus = HPPA_MAX_CPUS;
     mc->default_ram_size = 1024 * MiB;
+
+    object_class_property_add_str(oc, "superio", c3700_get_superio,
+                                  c3700_set_superio);
+    object_class_property_set_description(oc, "superio",
+        "SuperIO chip model: 'pc87560' (default, PCI slot 2) or 'ns87560' "
+        "(PCI slot 14)");
 }
 
 static void HP_A400_machine_init_class_init(ObjectClass *oc, const void *data)

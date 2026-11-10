@@ -161,7 +161,8 @@ qtests_hppa = \
   (config_all_accel.has_key('CONFIG_TCG') and \
    config_all_devices.has_key('CONFIG_GENERIC_LOADER') ? ['hppa-fpu-test'] : []) + \
   qtests_filter + \
-  (config_all_devices.has_key('CONFIG_VGA') ? ['display-vga-test'] : [])
+  (config_all_devices.has_key('CONFIG_VGA') ? ['display-vga-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_NS87560') ? ['ns87560-test'] : [])
 
 qtests_loongarch64 = qtests_filter + \
   (config_all_devices.has_key('CONFIG_LOONGARCH_VIRT') ? ['numa-test'] : []) + \
